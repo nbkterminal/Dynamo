@@ -12,6 +12,7 @@ import random
 import re
 import struct # For packing/unpacking binary data for ISO 8583
 import socket # For direct TCP socket communication with ISO 8583 server
+import base64 # Added for decoding Base64 service account key
 from datetime import datetime, date, timedelta
 from functools import wraps
 
@@ -673,40 +674,55 @@ app_id = os.environ.get('__app_id', 'default-app-id')
 firebase_config_str = os.environ.get('__firebase_config', '{}')
 initial_auth_token = os.environ.get('__initial_auth_token', None)
 
+# Environment variable for service account key (for Render/non-Canvas deployments)
+FIREBASE_SERVICE_ACCOUNT_KEY_BASE64 = os.environ.get('FIREBASE_SERVICE_ACCOUNT_KEY_BASE64')
+
 db = None # Firestore client
 current_user_id = None # Authenticated user ID
 
 # Initialize Firebase Admin SDK and Firestore client
-# This block runs when the module is loaded.
-if firebase_config_str:
-    try:
-        firebase_config = json.loads(firebase_config_str)
-        if not firebase_admin._apps: # Prevent re-initialization
+if not firebase_admin._apps: # Prevent re-initialization if already initialized
+    if FIREBASE_SERVICE_ACCOUNT_KEY_BASE64:
+        # Option 1: Initialize with service account key from environment variable (recommended for Render)
+        try:
+            service_account_info = json.loads(base64.b64decode(FIREBASE_SERVICE_ACCOUNT_KEY_BASE64).decode('utf-8'))
+            cred = credentials.Certificate(service_account_info)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            logger.info("Firebase Admin SDK initialized using service account key from environment variable.")
+        except Exception as e:
+            logger.error(f"Error initializing Firebase with service account key: {e}. Firestore will not be available.")
+            db = None
+    elif firebase_config_str:
+        # Option 2: Initialize with Canvas-provided config (for Canvas-native deployments)
+        try:
+            firebase_config = json.loads(firebase_config_str)
             firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
-        db = firestore.client()
-        logger.info("Firebase Admin SDK initialized successfully.")
+            db = firestore.client()
+            logger.info("Firebase Admin SDK initialized using Canvas-provided config.")
+        except Exception as e:
+            logger.error(f"Error initializing Firebase with Canvas config: {e}. Firestore will not be available.")
+            db = None
+    else:
+        logger.warning("No Firebase config or service account key found in environment. Firestore will not be available.")
+        db = None
 
-        # Authenticate with custom token if provided (Canvas environment)
-        if initial_auth_token:
-            try:
-                decoded_token = auth.verify_id_token(initial_auth_token)
-                current_user_id = decoded_token['uid']
-                logger.info(f"Signed in with custom token. User ID: {current_user_id}")
-            except Exception as e:
-                logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
-                current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
-        else:
-            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
-            logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
-
-    except Exception as e:
-        logger.error(f"Error initializing Firebase Admin SDK: {e}. Firestore will not be available.")
-        db = None # Ensure db is None if initialization fails
-        current_user_id = None # Ensure user ID is None if initialization fails
+# Set current_user_id after Firebase initialization attempt
+if db: # Only proceed with auth if db client was successfully initialized
+    if initial_auth_token:
+        try:
+            decoded_token = auth.verify_id_token(initial_auth_token)
+            current_user_id = decoded_token['uid']
+            logger.info(f"Signed in with custom token. User ID: {current_user_id}")
+        except Exception as e:
+            logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
+            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
+    else:
+        current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
+        logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
 else:
-    logger.warning("Firebase config not found in environment variables. Firestore will not be available.")
-    db = None
-    current_user_id = None
+    current_user_id = None # Ensure user ID is None if Firebase init failed
+
 
 # --- Firestore Helpers (defined after Firebase init) ---
 def get_transactions_collection_ref():
