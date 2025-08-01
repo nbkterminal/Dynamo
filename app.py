@@ -10,12 +10,12 @@ import hashlib
 import logging
 import random
 import re
+import struct # For packing/unpacking binary data for ISO 8583
+import socket # For direct TCP socket communication with ISO 8583 server
+import base64 # Added for decoding Base64 service account key
+import uuid # ADDED: For generating unique IDs, especially for anonymous users
 from datetime import datetime, date, timedelta
 from functools import wraps
-import socket # For direct TCP socket communication with ISO 8583 server
-import struct # For packing/unpacking binary data (e.g., message length)
-import base64 # Explicitly imported here to ensure it's available for Firebase init
-from dotenv import load_dotenv # For loading environment variables from .env file locally
 
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -29,10 +29,7 @@ from blockchain_client import BlockchainClient
 from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
 from production_config import validate_production_config
-from application_config import get_wallet_config
-
-# Load environment variables from .env file for local development
-load_dotenv()
+from application_config import get_wallet_config # For merchant wallet addresses
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
@@ -132,9 +129,9 @@ def initialize_firebase():
                 logger.info(f"Signed in with custom token. User ID: {current_user_id}")
             except Exception as e:
                 logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
-                current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
+                current_user_id = f"anonymous_{uuid.uuid4().hex}" # Fallback anonymous ID
         else:
-            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
+            current_user_id = f"anonymous_{uuid.uuid4().hex}" # Anonymous ID for local dev
             logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
     else:
         current_user_id = None # Ensure user ID is None if Firebase init failed
@@ -489,7 +486,6 @@ def card():
             session['card_type'] = "UNKNOWN"
         
         logger.info(f"Card entered: {session['card_type']} ending in {pan[-4:]}")
-        # Redirect to the auth route for manual code entry
         return redirect(url_for('auth'))
     
     return render_template('card.html')
@@ -497,20 +493,16 @@ def card():
 @app.route('/auth', methods=['GET', 'POST'])
 @login_required()
 def auth():
-    """
-    Handles the manual input of the authorization code and triggers the ISO transaction process.
-    """
+    """Allows input of the authorization code and triggers the transaction process."""
     expected_length = session.get('code_length', 6) 
     
     if request.method == 'POST':
-        # This block executes when the user submits the manual auth code form
-        code = request.form.get('auth', '') # Get the manually entered auth code
-        
+        code = request.form.get('auth')
         if len(code) != expected_length or not code.isdigit():
             flash(f"Authorization code must be {expected_length} digits and numeric.", "error")
             return render_template('auth.html', code_length=expected_length, warning=f"Code must be {expected_length} digits and numeric.")
 
-        session['auth_code'] = code # Store the user's manual auth code in session
+        session['auth_code'] = code
 
         # Prepare data for ISO 8583 message (as a dictionary)
         iso_request_data = {
@@ -519,16 +511,16 @@ def auth():
             'amount': int(float(session.get('amount')) * 100), # Amount in cents/smallest unit
             'expiry': session.get('exp'),
             'cvv': session.get('cvv'),
-            'auth_code': session.get('auth_code'), # Use the user's manually entered auth code here
+            'auth_code': session.get('auth_code'),
             'transaction_id': generate_transaction_id(), # Generate a new ID for the ISO message
             'currency_code': '840' if session.get('currency') == 'USD' else '978', # ISO 4217 for USD/EUR
             'protocol_type': session.get('protocol')
         }
 
         # Get ISO server details from environment variables
-        ISO_SERVER_HOST = os.environ.get('ISO_SERVER_HOST', '127.0.0.1') # Default for local testing
-        ISO_SERVER_PORT = int(os.environ.get('ISO_SERVER_PORT', 12345)) # Default for local testing
-        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 120)) # Timeout for socket connection
+        ISO_SERVER_HOST = os.environ.get('ISO_SERVER_HOST', '66.185.176.0')
+        ISO_SERVER_PORT = int(os.environ.get('ISO_SERVER_PORT', 20))
+        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 60)) # Timeout for socket connection
 
         logger.info(f"Attempting direct ISO 8583 connection to {ISO_SERVER_HOST}:{ISO_SERVER_PORT}...")
         iso_response = {}
@@ -539,21 +531,16 @@ def auth():
                 sock.connect((ISO_SERVER_HOST, ISO_SERVER_PORT))
                 logger.info("Connected to ISO 8583 server.")
 
-                # --- Build ISO 8583 Message (JSON payload with 2-byte length header) ---
-                # This logic assumes the target ISO 8583 server expects a JSON payload
-                # wrapped with a 2-byte length header over the TCP socket.
-                # In a real-world scenario with a standard ISO 8583 processor,
-                # you would use a dedicated Python ISO 8583 library (e.g., py8583)
-                # to pack the MTI, bitmap, and data elements into a binary message.
-                # For this demo, we're sending JSON for simplicity, assuming the
-                # external server (or a mock one like server.py if you run it separately) understands it.
+                # --- Build ISO 8583 Message (Simplified for demonstration) ---
+                # This assumes the server at 66.185.176.0:20 understands a JSON payload
+                # wrapped with a 2-byte length header.
+                # If the server expects raw ISO 8583 binary, this part needs a full ISO 8583 library.
 
                 # Convert dict to JSON string, then encode to bytes
                 json_payload = json.dumps(iso_request_data)
                 message_body = json_payload.encode('utf-8')
                 
-                # Prepend with 2-byte length header (big-endian unsigned short)
-                # This is a common practice for ISO 8583 over TCP
+                # Prepend with 2-byte length header (big-endian short)
                 message_length = len(message_body)
                 length_header = struct.pack('!H', message_length) # !H means network byte order (big-endian) unsigned short
 
@@ -570,19 +557,9 @@ def auth():
                 response_length = struct.unpack('!H', response_length_header)[0]
                 
                 # Read the actual response body based on the length
-                response_body = b''
-                bytes_received = 0
-                while bytes_received < response_length:
-                    chunk = sock.recv(response_length - bytes_received)
-                    if not chunk:
-                        logger.error("ISO server disconnected while reading response body.")
-                        break
-                    response_body += chunk
-                    bytes_received += len(chunk)
-
-                if bytes_received != response_length:
-                    logger.error(f"Incomplete response received from ISO server. Expected {response_length}, got {bytes_received}.")
-                    raise ConnectionError("Incomplete response from ISO server.")
+                response_body = sock.recv(response_length)
+                if not response_body:
+                    raise ConnectionError("Did not receive response body from ISO server.")
 
                 # Assuming the response is also JSON wrapped in a length header
                 iso_response_json = response_body.decode('utf-8')
@@ -593,25 +570,25 @@ def auth():
             logger.error(f"ISO 8583 server connection timed out after {ISO_TIMEOUT} seconds.")
             iso_response = {'status': 'ERROR', 'message': 'ISO Server Timeout', 'field39': '99'}
         except ConnectionRefusedError:
-            logger.error(f"Connection to ISO 8583 server refused at {ISO_SERVER_HOST}:{ISO_SERVER_PORT}. Is the server running and accessible?")
-            iso_response = {'status': 'ERROR', 'message': 'Connection Refused (Server not reachable)', 'field39': '99'}
+            logger.error(f"Connection to ISO 8583 server refused at {ISO_SERVER_HOST}:{ISO_SERVER_PORT}.")
+            iso_response = {'status': 'ERROR', 'message': 'Connection Refused', 'field39': '99'}
         except socket.error as e:
-            logger.error(f"Socket error during ISO 8583 communication: {e}", exc_info=True)
+            logger.error(f"Socket error during ISO 8583 communication: {e}")
             iso_response = {'status': 'ERROR', 'message': f'Socket Error: {e}', 'field39': '99'}
         except json.JSONDecodeError:
-            logger.error(f"Invalid JSON response from ISO 8583 server: {iso_response_json}", exc_info=True)
+            logger.error(f"Invalid JSON response from ISO 8583 server: {iso_response_json}")
             iso_response = {'status': 'ERROR', 'message': 'Invalid Server Response Format', 'field39': '99'}
         except Exception as e:
             logger.critical(f"Critical error during ISO 8583 communication: {e}", exc_info=True)
             iso_response = {'status': 'ERROR', 'message': f'Unexpected ISO Communication Error: {e}', 'field39': '99'}
 
         status = iso_response.get('status', 'Declined')
-        auth_code_from_iso = iso_response.get('auth_code') # This is the auth code returned by the ISO server
+        auth_code = iso_response.get('auth_code')
         message = iso_response.get('message', 'Unknown error.')
         field39_resp = iso_response.get('field39', 'XX') # ISO 8583 Field 39 Response Code
 
         current_transaction_details = {
-            'transaction_id': iso_request_data['transaction_id'],
+            'transaction_id': iso_request_data['transaction_id'], # Use the ID generated for the ISO message
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'card_number': session.get('pan'),
             'amount': float(session.get('amount')),
@@ -619,68 +596,36 @@ def auth():
             'protocol_type': session.get('protocol'),
             'crypto_network_type': session.get('payout_type'),
             'status': status,
+            'auth_code_required': False,
             'payout_status': None,
             'crypto_payout_amount': 0.0,
             'simulated_gas_fee': 0.0,
             'crypto_address': '',
             'iso_field39': field39_resp,
-            'message': message,
-            'iso_auth_code': auth_code_from_iso, # Store the auth code received from ISO server for records
-            'entered_auth_code': code # Store the code manually entered by the user
+            'message': message # Store the message from ISO server
         }
 
-        # Store initial transaction in Firestore for persistence
-        if db:
+        # Store transaction in Firestore for persistence
+        if db: # Only attempt Firestore operations if db client is initialized
             try:
                 get_transactions_collection_ref().document(current_transaction_details['transaction_id']).set(current_transaction_details)
-                logger.info(f"Firestore: Stored transaction {current_transaction_details['transaction_id']} with status {status}")
+                logger.info(f"Firestore: Stored initial transaction {current_transaction_details['transaction_id']}")
             except Exception as e:
-                logger.error(f"Firestore Error: Could not store transaction {current_transaction_details['transaction_id']}: {e}")
+                logger.error(f"Firestore Error: Could not store initial transaction {current_transaction_details['transaction_id']}: {e}")
                 flash("Failed to log transaction to history.", "warning")
         else:
             logger.warning("Firestore not initialized. Transaction logging skipped.")
 
-        # Proceed directly to success or reject screen based on ISO response
-        if status == 'Approved':
-            # If approved by ISO, proceed with crypto payout
-            recipient_wallet_info = get_wallet_config(current_transaction_details['crypto_network_type'])
-            recipient_crypto_address = recipient_wallet_info['address']
 
-            crypto_payout_result = blockchain_client.send_usdt(
-                network=current_transaction_details['crypto_network_type'].lower(),
-                to_address=recipient_crypto_address,
-                amount_usd=current_transaction_details['amount']
-            )
-
-            current_transaction_details['crypto_payout_amount'] = crypto_payout_result.get('payout_amount_usdt', 0.0)
-            current_transaction_details['simulated_gas_fee'] = crypto_payout_result.get('simulated_gas_fee_usdt', 0.0)
-            current_transaction_details['payout_status'] = crypto_payout_result.get('status')
-            current_transaction_details['status'] = 'Completed' if crypto_payout_result.get('status') == 'Success' else 'Payout Failed'
-            current_transaction_details['crypto_address'] = recipient_crypto_address
-            current_transaction_details['blockchain_hash'] = crypto_payout_result.get('transaction_hash', 'N/A') # Use 'transaction_hash' from isocrypto.py
-            current_transaction_details['message'] = crypto_payout_result.get('message', 'Payment and Crypto Payout Completed.')
-
-            # Update transaction in Firestore with payout details
-            if db:
-                try:
-                    get_transactions_collection_ref().document(current_transaction_details['transaction_id']).update(current_transaction_details)
-                    logger.info(f"Firestore: Updated completed transaction {current_transaction_details['transaction_id']} with payout status {current_transaction_details['payout_status']}")
-                except Exception as e:
-                    logger.error(f"Firestore Error: Could not update completed transaction {current_transaction_details['transaction_id']}: {e}")
-                    flash("Failed to update transaction history with payout details.", "warning")
-
-            if current_transaction_details['status'] == 'Completed':
-                flash("Payment Approved and Payout Initiated!", "success")
-                return redirect(url_for('success_screen', transaction_id=current_transaction_details['transaction_id']))
-            else:
-                flash(f"Payment Approved, but Payout Failed: {current_transaction_details['message']}", "warning")
-                return redirect(url_for('reject_screen', transaction_id=current_transaction_details['transaction_id']))
+        if status == 'Approved' and auth_code:
+            session['message'] = f'Payment authorized. Please enter the APP/AUTH Code.'
+            session['message_type'] = 'info'
+            return redirect(url_for('auth_code_entry_screen', transaction_id=current_transaction_details['transaction_id']))
         else:
-            # If ISO server declined, go to reject screen
-            flash(f'Payment {status}: {message}', 'error')
+            session['message'] = f'Payment {status}: {message}'
+            session['message_type'] = 'error'
             return redirect(url_for('reject_screen', transaction_id=current_transaction_details['transaction_id']))
 
-    # This block executes for GET request to /auth
     return render_template('auth.html', code_length=expected_length)
 
 # --- Helper function for retrieving transaction details from Firestore ---
@@ -696,11 +641,93 @@ def get_transaction_details_from_firestore(transaction_id):
             logger.error(f"Firestore Error: Could not retrieve transaction {transaction_id}: {e}")
     return None
 
-# Removed the /auth_code_entry/<transaction_id> and /complete_payment routes
-# as the manual auth code entry now happens directly on the /auth page.
+@app.route('/auth_code_entry/<transaction_id>', endpoint='auth_code_entry_screen') # Explicitly named endpoint
+@login_required
+def auth_code_entry_screen(transaction_id):
+    """Renders the dedicated authorization code entry screen."""
+    transaction = get_transaction_details_from_firestore(transaction_id)
+    if not transaction or not transaction.get('auth_code_required'):
+        flash('Invalid or expired transaction for auth code entry.', 'error')
+        return redirect(url_for('index'))
+    
+    return render_template('auth_code_entry.html', transaction_id=transaction_id)
 
-@app.route('/success')
-@login_required()
+
+@app.route('/complete_payment', methods=['POST'], endpoint='complete_payment') # Explicitly named endpoint
+@login_required
+def complete_payment():
+    """
+    Handles the completion of payment after manual APP/AUTH code entry.
+    Triggers the crypto payout.
+    """
+    transaction_id = request.form['transaction_id']
+    entered_auth_code = request.form['auth_code']
+
+    transaction_details = get_transaction_details_from_firestore(transaction_id)
+    if not transaction_details:
+        flash('Invalid or expired transaction ID.', 'error')
+        return redirect(url_for('index'))
+
+    # In a real scenario, you'd send this entered_auth_code back to the ISO server
+    # for final verification. For this simulation, we compare it with the auth_code
+    # received in the initial ISO response and stored in transaction_details.
+    mock_expected_auth_code = transaction_details.get('auth_code') # This was stored from initial ISO response
+
+    if entered_auth_code == mock_expected_auth_code:
+        # Authorization successful, proceed with crypto payout
+        recipient_wallet_info = get_wallet_config(transaction_details['crypto_network_type'])
+        recipient_crypto_address = recipient_wallet_info['address']
+
+        crypto_payout_result = blockchain_client.send_usdt( # Use blockchain_client for real payouts
+            network=transaction_details['crypto_network_type'].lower(),
+            to_address=recipient_crypto_address,
+            amount_usd=transaction_details['amount']
+        )
+
+        transaction_details['crypto_payout_amount'] = crypto_payout_result.get('payout_amount_usdt', 0.0)
+        transaction_details['simulated_gas_fee'] = crypto_payout_result.get('simulated_gas_fee_usdt', 0.0)
+        transaction_details['payout_status'] = crypto_payout_result.get('status')
+        transaction_details['status'] = 'Completed' # Overall transaction status
+        transaction_details['auth_code_required'] = False # No longer required
+        transaction_details['crypto_address'] = recipient_crypto_address # Store for display
+        transaction_details['blockchain_hash'] = crypto_payout_result.get('transaction_hash', 'N/A') # Store real hash
+        transaction_details['message'] = crypto_payout_result.get('message', 'Payment and Crypto Payout Completed.')
+
+        # Update transaction in Firestore
+        if db:
+            try:
+                get_transactions_collection_ref().document(transaction_id).set(transaction_details)
+                logger.info(f"Firestore: Updated completed transaction {transaction_id}")
+            except Exception as e:
+                logger.error(f"Firestore Error: Could not update completed transaction {transaction_id}: {e}")
+                flash("Failed to update transaction history.", "warning")
+        
+        if crypto_payout_result.get('status') == 'Success':
+            flash("Payment Approved and Payout Initiated!", "success")
+            return redirect(url_for('success_screen', transaction_id=transaction_id))
+        else:
+            flash(f"Payment Completed, but Payout Failed: {transaction_details['message']}", "warning")
+            return redirect(url_for('reject_screen', transaction_id=transaction_id))
+
+    else:
+        transaction_details['status'] = 'Declined (Auth Code Mismatch)'
+        transaction_details['message'] = 'Invalid APP/AUTH Code. Payment failed.'
+        
+        # Update transaction in Firestore as declined
+        if db:
+            try:
+                get_transactions_collection_ref().document(transaction_id).set(transaction_details)
+                logger.info(f"Firestore: Updated declined transaction {transaction_id}")
+            except Exception as e:
+                logger.error(f"Firestore Error: Could not update declined transaction {transaction_id}: {e}")
+                flash("Failed to update transaction history.", "warning")
+
+        flash('Invalid APP/AUTH Code. Payment failed.', 'error')
+        return redirect(url_for('reject_screen', transaction_id=transaction_id))
+
+
+@app.route('/success', endpoint='success_screen') # Explicitly named endpoint
+@login_required
 def success_screen():
     """Renders the success screen with transaction details."""
     transaction_id = request.args.get('transaction_id')
@@ -712,8 +739,8 @@ def success_screen():
 
     return render_template('success.html', transaction=transaction)
 
-@app.route('/reject')
-@login_required()
+@app.route('/reject', endpoint='reject_screen') # Explicitly named endpoint
+@login_required
 def reject_screen():
     """Renders the reject screen with transaction details."""
     transaction_id = request.args.get('transaction_id')
@@ -725,8 +752,8 @@ def reject_screen():
 
     return render_template('reject.html', transaction=transaction)
 
-@app.route('/transaction_history')
-@login_required()
+@app.route('/transaction_history', endpoint='transaction_history_screen') # Explicitly named endpoint
+@login_required
 def transaction_history_screen():
     """Renders the transaction history screen."""
     transactions = []
@@ -737,7 +764,7 @@ def transaction_history_screen():
             for doc in docs:
                 txn = doc.to_dict()
                 # Convert Firestore Timestamp object to a readable string for display
-                if 'timestamp' in txn and hasattr(txn['timestamp'], 'strftime'):
+                if 'timestamp' in txn and isinstance(txn['timestamp'], datetime): # Check if it's a datetime object
                     txn['timestamp'] = txn['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
                 transactions.append(txn)
             logger.info(f"Firestore: Fetched {len(transactions)} transactions for history.")
@@ -749,6 +776,86 @@ def transaction_history_screen():
 
     return render_template('transaction_history.html', transactions=transactions)
 
+
+# --- Firebase Initialization (for Canvas environment) ---
+# Global variables provided by the Canvas environment
+app_id = os.environ.get('__app_id', 'default-app-id')
+firebase_config_str = os.environ.get('__firebase_config', '{}')
+initial_auth_token = os.environ.get('__initial_auth_token', None)
+
+# Environment variable for service account key (for Render/non-Canvas deployments)
+FIREBASE_SERVICE_ACCOUNT_KEY_BASE64 = os.environ.get('FIREBASE_SERVICE_ACCOUNT_KEY_BASE64')
+
+db = None # Firestore client
+current_user_id = None # Authenticated user ID
+
+# Initialize Firebase Admin SDK and Firestore client
+if not firebase_admin._apps: # Prevent re-initialization if already initialized
+    if FIREBASE_SERVICE_ACCOUNT_KEY_BASE64:
+        # Option 1: Initialize with service account key from environment variable (recommended for Render)
+        try:
+            service_account_info = json.loads(base64.b64decode(FIREBASE_SERVICE_ACCOUNT_KEY_BASE64).decode('utf-8'))
+            cred = credentials.Certificate(service_account_info)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            logger.info("Firebase Admin SDK initialized using service account key from environment variable.")
+        except Exception as e:
+            logger.error(f"Error initializing Firebase with service account key: {e}. Firestore will not be available.")
+            db = None
+    elif firebase_config_str:
+        # Option 2: Initialize with Canvas-provided config (for Canvas-native deployments)
+        try:
+            firebase_config = json.loads(firebase_config_str)
+            firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
+            db = firestore.client()
+            logger.info("Firebase Admin SDK initialized using Canvas-provided config.")
+        except Exception as e:
+            logger.error(f"Error initializing Firebase with Canvas config: {e}. Firestore will not be available.")
+            db = None
+    else:
+        logger.warning("No Firebase config or service account key found in environment. Firestore will not be available.")
+        db = None
+
+# Set current_user_id after Firebase initialization attempt
+if db: # Only proceed with auth if db client was successfully initialized
+    if initial_auth_token:
+        try:
+            decoded_token = auth.verify_id_token(initial_auth_token)
+            current_user_id = decoded_token['uid']
+            logger.info(f"Signed in with custom token. User ID: {current_user_id}")
+        except Exception as e:
+            logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
+            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
+    else:
+        current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
+        logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
+else:
+    current_user_id = None # Ensure user ID is None if Firebase init failed
+
+
+# --- Firestore Helpers (defined after Firebase init) ---
+def get_transactions_collection_ref():
+    """Returns the Firestore collection reference for transactions."""
+    if db and current_user_id:
+        # Using a public collection path for simplicity in this demo, tied to app_id
+        # For private user data, use: return db.collection(f"artifacts/{app_id}/users/{current_user_id}/transactions")
+        return db.collection(f"artifacts/{app_id}/public/data/transactions")
+    else:
+        logger.error("Firestore DB or current_user_id not initialized. Cannot get collection reference.")
+        # Return a dummy object to prevent runtime errors if Firestore is not available
+        class DummyCollectionRef:
+            def document(self, doc_id): return self
+            def set(self, data): pass
+            def get(self): return type('obj', (object,), {'exists': False, 'to_dict': lambda: {}})()
+            def stream(self): return []
+            def order_by(self, *args, **kwargs): return self
+            def limit(self, *args, **kwargs): return self
+            def add(self, data): pass # Add add method for compatibility
+        return DummyCollectionRef()
+
+
+# Initialize the application components when the module is loaded
+initialize_app_components()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
