@@ -1,0 +1,112 @@
+/* static/style.css */
+
+/* Base styles for the body, ensuring smooth font rendering */
+body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* Ensure Inter font is applied globally, if not already by Tailwind */
+    font-family: 'Inter', sans-serif;
+    color: #e2e8f0; /* Light gray text for dark background */
+    background-color: #1a202c; /* Dark background */
+}
+
+/* Custom Scrollbar Styles (for WebKit browsers like Chrome/Android WebView) */
+/* This makes scrollbars less intrusive and visually appealing in a dark theme */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #2d3748; /* Darker gray for the track */
+    border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #4a5568; /* Medium gray for the thumb */
+    border-radius: 10px;
+    border: 2px solid #2d3748; /* Border to make it appear thinner */
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #6366f1; /* Indigo-500 on hover */
+}
+
+/* Flash Messages - Moved from inline styles in HTML for better organization */
+/* These styles provide clear visual feedback for success, error, warning, and info messages */
+.flash-message {
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    border-radius: 0.5rem;
+    font-weight: 600;
+    text-align: center;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.flash-success {
+    background-color: #d4edda; /* Light green */
+    color: #155724; /* Dark green text */
+    border: 1px solid #c3e6cb; /* Green border */
+}
+
+.flash-danger, .flash-error { /* Combined for error and danger messages */
+    background-color: #f8d7da; /* Light red */
+    color: #721c24; /* Dark red text */
+    border: 1px solid #f5c6cb; /* Red border */
+}
+
+.flash-warning {
+    background-color: #fff3cd; /* Light yellow */
+    color: #856404; /* Dark yellow text */
+    border: 1px solid #ffeeba; /* Yellow border */
+}
+
+.flash-info {
+    background-color: #d1ecf1; /* Light blue */
+    color: #0c5460; /* Dark blue text */
+    border: 1px solid #bee5eb; /* Blue border */
+}
+
+/* General button styling enhancements (beyond Tailwind's default) */
+/* Adds subtle shadows and transitions for a more interactive feel */
+button, .button-link {
+    transition: all 0.2s ease-in-out;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+button:hover, .button-link:hover {
+    box-shadow: 0 6px 8px rgba(0, 0, 0, 0.15);
+}
+
+/* Input focus styles for consistency */
+input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: #6366f1; /* Indigo-500 */
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.4); /* Indigo-500 with opacity */
+}
+
+/* Specific styles for the main content container to ensure it's centered and responsive */
+.main-container {
+    background-color: #2d3748; /* Dark gray for card-like container */
+    padding: 1.5rem; /* p-6 */
+    border-radius: 0.75rem; /* rounded-xl */
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.08); /* shadow-2xl */
+    width: 100%;
+    max-width: 28rem; /* max-w-md */
+    border: 1px solid #4a5568; /* border border-gray-700 */
+}
+
+/* Ensure full height for mobile devices, especially Android terminals */
+html, body {
+    height: 100%;
+}
+#root { /* If you were using React, this would be the root div */
+    height: 100%;
+}
+
+/* Additional responsive adjustments for smaller screens if needed */
+@media (max-width: 640px) {
+    .main-container {
+        padding: 1rem; /* Smaller padding on very small screens */
+    }
+}

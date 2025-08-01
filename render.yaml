@@ -1,0 +1,74 @@
+# render.yaml
+# This file configures your web service deployment on Render.
+
+services:
+  - type: web
+    name: black-rock-terminal
+    env: python
+    # Specify the Python version. Ensure this matches your local development environment
+    # and is compatible with your project's dependencies.
+    pythonVersion: 3.9.18 # Recommended for stability, adjust if needed
+
+    # Command to install dependencies from requirements.txt
+    buildCommand: pip install -r requirements.txt
+
+    # Command to start your Flask application using Gunicorn
+    # --workers 4: Runs 4 worker processes for concurrency
+    # --bind 0.0.0.0:$PORT: Binds to all interfaces on the port provided by Render
+    # app:app: Specifies that 'app' is the Flask application instance within 'app.py'
+    startCommand: gunicorn app:app --workers 4 --bind 0.0.0.0:$PORT
+
+    # Environment variables for production.
+    # IMPORTANT: Do NOT put sensitive values here directly.
+    # Instead, set them in the Render dashboard for your service.
+    # This section is mostly for demonstrating which variables your app expects.
+    envVars:
+      # Flask session secret key. Render can generate this for you.
+      - key: SESSION_SECRET
+        generateValue: true # Render will generate a strong secret key for your Flask app
+
+      # ISO 8583 Server Details (your universal ISO 8583 server)
+      # Replace with your actual server details in Render dashboard.
+      - key: ISO_SERVER_HOST
+        value: 66.185.176.0 # Example value, set your actual host in Render dashboard
+      - key: ISO_SERVER_PORT
+        value: 20 # Example value, set your actual port in Render dashboard
+      - key: ISO_TIMEOUT
+        value: 60 # Timeout for ISO connection in seconds
+
+      # Default Merchant Wallet Addresses (where crypto payouts will go)
+      # Set your actual wallets in Render dashboard.
+      - key: DEFAULT_ERC20_WALLET
+        value: 0xDefaultERC20WalletAddressForTesting # Replace in Render dashboard
+      - key: DEFAULT_TRC20_WALLET
+        value: TDefaultTRC20WalletAddressForTesting # Replace in Render dashboard
+
+      # Your Self-Custodied Payout Wallet Private Keys (for real crypto payouts)
+      # CRITICAL: Store these SECURELY in Render dashboard, NOT here.
+      - key: ETH_PAYOUT_PRIVATE_KEY
+        value: your_ethereum_private_key_hex_string # Replace in Render dashboard
+      - key: TRX_PAYOUT_PRIVATE_KEY
+        value: your_tron_private_key_hex_string # Replace in Render dashboard
+
+      # RPC API Keys
+      # Set your actual API keys in Render dashboard.
+      - key: INFURA_API_KEY
+        value: your_infura_project_id # Replace in Render dashboard
+      - key: TRONGRID_API_KEY
+        value: your_trongrid_api_key # Replace in Render dashboard
+
+      # Other application configurations
+      - key: DAILY_LIMIT_PER_TERMINAL
+        value: 10000000 # Set your desired daily limit
+      - key: DEFAULT_TRANSACTION_AMOUNT
+        value: 1000000 # Set your desired default transaction amount
+
+      # Firebase Configuration (for Canvas environment)
+      # Render will automatically inject these if deployed via Canvas.
+      # You typically don't need to set these manually on Render.
+      - key: __app_id
+        value: "" # Render/Canvas injects this
+      - key: __firebase_config
+        value: "" # Render/Canvas injects this
+      - key: __initial_auth_token
+        value: "" # Render/Canvas injects this

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Payment Terminal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            -webkit-tap-highlight-color: transparent; /* Remove tap highlight on mobile */
+        }
+        /* Custom styles for flash messages for better visibility */
+        .flash-message {
+            padding: 0.75rem 1rem;
+            margin-bottom: 1rem;
+            border-radius: 0.5rem;
+            font-weight: 600;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .flash-danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .flash-warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        .flash-info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+
+        /* Focus styles for inputs */
+        input:focus, select:focus {
+            outline: none;
+            border-color: #6366f1; /* Indigo-500 */
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.4); /* Indigo-500 with opacity */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 min-h-screen flex items-center justify-center p-4 text-white">
+    <div class="bg-gray-800 p-6 rounded-xl shadow-2xl w-full max-w-md border border-gray-700">
+        <div class="flex justify-between items-center mb-6">
+            <h2 class="text-2xl font-bold text-white">Payment Terminal</h2>
+            <a href="{{ url_for('logout') }}" class="text-blue-400 hover:text-blue-300 text-sm font-medium transition duration-200">Logout</a>
+        </div>
+
+        <!-- Flash Messages -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="mb-4">
+                    {% for category, message in messages %}
+                        <div class="flash-message flash-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        <form method="POST" action="{{ url_for('process_payment') }}" class="space-y-4">
+            <div>
+                <label for="card_number" class="block text-gray-300 text-sm font-medium mb-1">Card Number</label>
+                <input type="text" id="card_number" name="card_number" required maxlength="19"
+                       class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 transition duration-200"
+                       placeholder="XXXX XXXX XXXX XXXX"
+                       oninput="this.value = this.value.replace(/\D/g, '').replace(/(.{4})/g, '$1 ').trim();">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label for="card_expiry_month" class="block text-gray-300 text-sm font-medium mb-1">MM</label>
+                    <input type="text" id="card_expiry_month" name="card_expiry_month" required maxlength="2"
+                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 transition duration-200"
+                           placeholder="MM" pattern="\d{2}">
+                </div>
+                <div>
+                    <label for="card_expiry_year" class="block text-gray-300 text-sm font-medium mb-1">YY</label>
+                    <input type="text" id="card_expiry_year" name="card_expiry_year" required maxlength="2"
+                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 transition duration-200"
+                           placeholder="YY" pattern="\d{2}">
+                </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label for="cvv_cvc" class="block text-gray-300 text-sm font-medium mb-1">CVV/CVC</label>
+                    <input type="text" id="cvv_cvc" name="cvv_cvc" required maxlength="4"
+                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 transition duration-200"
+                           placeholder="XXX/XXXX">
+                </div>
+                <div>
+                    <label for="authorization_code" class="block text-gray-300 text-sm font-medium mb-1">Auth Code</label>
+                    <input type="text" id="authorization_code" name="authorization_code" required maxlength="6"
+                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 transition duration-200"
+                           placeholder="e.g., 123456">
+                </div>
+            </div>
+
+            <div>
+                <label for="amount" class="block text-gray-300 text-sm font-medium mb-1">Amount</label>
+                <input type="number" id="amount" name="amount" required step="0.01" min="0.01"
+                       class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 transition duration-200"
+                       placeholder="e.g., 100.00">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label for="currency" class="block text-gray-300 text-sm font-medium mb-1">Currency</label>
+                    <select id="currency" name="currency" required
+                            class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-indigo-500 transition duration-200">
+                        <option value="USD">USD</option>
+                        <option value="EUR">EUR</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="crypto_network_type" class="block text-gray-300 text-sm font-medium mb-1">Payout Network</label>
+                    <select id="crypto_network_type" name="crypto_network_type" required
+                            class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-indigo-500 transition duration-200">
+                        <option value="ERC20">ERC20 (Ethereum)</option>
+                        <option value="TRC20">TRC20 (Tron)</option>
+                    </select>
+                </div>
+            </div>
+
+            <div>
+                <label for="protocol_type" class="block text-gray-300 text-sm font-medium mb-1">Protocol Type</label>
+                <select id="protocol_type" name="protocol_type" required
+                        class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-2 focus:ring-indigo-500 transition duration-200">
+                    <option value="POS_101_1">POS Terminal -101.1 (4-digit approval)</option>
+                    <option value="POS_101_4">POS Terminal -101.4 (6-digit approval)</option>
+                    <option value="POS_101_6">POS Terminal -101.6 (Pre-authorization)</option>
+                    <option value="POS_101_7">POS Terminal -101.7 (4-digit approval)</option>
+                    <option value="POS_101_8">POS Terminal -101.8 (PIN-LESS transaction)</option>
+                    <option value="POS_201_1">POS Terminal -201.1 (6-digit approval)</option>
+                    <option value="POS_201_3">POS Terminal -201.3 (6-digit approval)</option>
+                    <option value="POS_201_5">POS Terminal -201.5 (6-digit approval)</option>
+                </select>
+            </div>
+
+            <button type="submit"
+                    class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-lg shadow-lg transform transition duration-300 ease-in-out hover:scale-105 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-75">
+                Process Payment
+            </button>
+            <a href="{{ url_for('transaction_history_screen') }}"
+               class="block w-full text-center bg-gray-700 hover:bg-gray-600 text-white font-bold py-3 rounded-lg shadow-lg mt-3 transform transition duration-300 ease-in-out hover:scale-105 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-opacity-75">
+                View History
+            </a>
+        </form>
+    </div>
+</body>
+</html>

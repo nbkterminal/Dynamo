@@ -1,0 +1,6 @@
+<audio id="success-sound" src="{{ url_for('static', filename='audio/success.mp3') }}"></audio>
+<script>
+  window.onload = function() {
+    document.getElementById("success-sound").play();
+  };
+</script>
