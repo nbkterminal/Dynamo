@@ -552,7 +552,7 @@ def auth_code_entry_screen(transaction_id):
     return render_template('auth_code_entry.html', transaction_id=transaction_id)
 
 
-@app.route('/complete_payment', methods=['POST'])
+    @app.route('/complete_payment', methods=['POST'], endpoint='complete_payment_route')
 @login_required
 def complete_payment():
     """
