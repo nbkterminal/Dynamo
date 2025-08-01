@@ -638,7 +638,7 @@ def success_screen():
 
     return render_template('success.html', transaction=transaction)
 
-@app.route('/reject')
+@app.route('/reject', endpoint='reject_screen_route') # Add endpoint name here
 @login_required
 def reject_screen():
     """Renders the reject screen with transaction details."""
@@ -651,7 +651,7 @@ def reject_screen():
 
     return render_template('reject.html', transaction=transaction)
 
-@app.route('/transaction_history')
+@app.route('/transaction_history', endpoint='transaction_history_screen') # Add endpoint name here
 @login_required
 def transaction_history_screen():
     """Renders the transaction history screen."""
