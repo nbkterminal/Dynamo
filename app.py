@@ -36,6 +36,7 @@ from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
 from production_config import validate_production_config
 from application_config import get_wallet_config # For merchant wallet addresses
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
