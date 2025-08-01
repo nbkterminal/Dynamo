@@ -625,7 +625,7 @@ def complete_payment():
         return redirect(url_for('reject_screen', transaction_id=transaction_id))
 
 
-@app.route('/success')
+@app.route('/success', endpoint='success_screen_route') # Add endpoint name here
 @login_required
 def success_screen():
     """Renders the success screen with transaction details."""
