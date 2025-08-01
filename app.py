@@ -53,7 +53,7 @@ blockchain_client = BlockchainClient()
 
 # Initialize production security middleware
 security_middleware = SecurityMiddleware(app)
-production_config = get_production_config()
+production_config = validate_production_config()
 
 # Validate production configuration on startup
 if not validate_production_config():
