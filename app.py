@@ -156,6 +156,16 @@ def login():
     
     return render_template('login.html')
 
++@app.route('/forgot_password', methods=['GET', 'POST'])
++def forgot_password():
++    """
++    Handles the 'Forgot Password' functionality.
++    """
++    if request.method == 'POST':
++        flash('Password reset instructions sent to your email (simulated).', 'info')
++        return redirect(url_for('login'))
++    return render_template('forgot_password.html')
+
 @app.route('/logout')
 def logout():
     """Handles user logout, clearing the session."""
