@@ -2,9 +2,10 @@
 # This is the main Flask application for the BlackRock Payment Terminal.
 # It handles user authentication, transaction flow, direct communication with an external
 # ISO 8583 server for card authorization via TCP sockets, and real-time cryptocurrency payouts.
+# Now with Firestore integration for persistent transaction history.
 
 import os
-import json
+import json # For parsing Firebase config
 import hashlib
 import logging
 import random
@@ -13,20 +14,25 @@ from datetime import datetime, date, timedelta
 from functools import wraps
 import socket # For direct TCP socket communication with ISO 8583 server
 import struct # For packing/unpacking binary data (e.g., message length)
+import base64 # Explicitly imported here to ensure it's available for Firebase init
+from dotenv import load_dotenv # For loading environment variables from .env file locally
 
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Firebase Admin SDK for server-side interaction with Firestore
 import firebase_admin
-from firebase_admin import credentials, firestore, auth # Added for Firebase initialization
+from firebase_admin import credentials, firestore, auth
 
-# Import custom modules for blockchain interaction and utilities
-from blockchain_client import BlockchainClient # Handles crypto payouts
-from utils import validate_card_number, format_amount, generate_transaction_id # Keeping utils for card validation, etc.
+# Import custom modules
+from blockchain_client import BlockchainClient
+from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
-from production_config import validate_production_config # Corrected: Removed get_production_config
-from application_config import get_wallet_config # For merchant wallet addresses
+from production_config import validate_production_config
+from config import get_wallet_config
+
+# Load environment variables from .env file for local development
+load_dotenv()
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
@@ -44,7 +50,6 @@ blockchain_client = BlockchainClient()
 
 # Initialize production security middleware
 security_middleware = SecurityMiddleware(app)
-# production_config = get_production_config() # Removed: get_production_config is not available
 
 # Validate production configuration on startup
 if not validate_production_config():
@@ -99,6 +104,7 @@ def initialize_firebase():
             # Option 2: Initialize with Canvas-provided config (for Canvas-native deployments)
             try:
                 firebase_config = json.loads(firebase_config_str)
+                # No need for firebase_admin._apps check here, it's already done by the outer if
                 firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
                 db = firestore.client()
                 firebase_auth = auth # Initialize auth client
@@ -506,7 +512,7 @@ def auth():
 
         session['auth_code'] = code # Store the user's manual auth code in session
 
-        # Prepare data for ISO 8583 message to be sent to the ISO processing function
+        # Prepare data for ISO 8583 message (as a dictionary)
         iso_request_data = {
             'mti': '0100',  # Authorization Request
             'pan': session.get('pan'),
@@ -519,20 +525,85 @@ def auth():
             'protocol_type': session.get('protocol')
         }
 
-        logger.info(f"Processing payment request internally via server.py with manual auth code...")
+        # Get ISO server details from environment variables
+        ISO_SERVER_HOST = os.environ.get('ISO_SERVER_HOST', '127.0.0.1') # Default for local testing
+        ISO_SERVER_PORT = int(os.environ.get('ISO_SERVER_PORT', 12345)) # Default for local testing
+        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 60)) # Timeout for socket connection
+
+        logger.info(f"Attempting direct ISO 8583 connection to {ISO_SERVER_HOST}:{ISO_SERVER_PORT}...")
         iso_response = {}
         try:
-            # Direct call to process_iso_message from server.py
-            # The server.py's process_iso_message expects 'mti' and 'data' dict.
-            iso_response = process_iso_message(
-                mti=iso_request_data['mti'],
-                data=iso_request_data
-            )
-            logger.info(f"Received response from internal ISO processing: {iso_response}")
+            # Create a socket connection
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(ISO_TIMEOUT)
+                sock.connect((ISO_SERVER_HOST, ISO_SERVER_PORT))
+                logger.info("Connected to ISO 8583 server.")
 
+                # --- Build ISO 8583 Message (JSON payload with 2-byte length header) ---
+                # This logic assumes the target ISO 8583 server expects a JSON payload
+                # wrapped with a 2-byte length header over the TCP socket.
+                # In a real-world scenario with a standard ISO 8583 processor,
+                # you would use a dedicated Python ISO 8583 library (e.g., py8583)
+                # to pack the MTI, bitmap, and data elements into a binary message.
+                # For this demo, we're sending JSON for simplicity, assuming the
+                # external server (or a mock one like server.py if you run it separately) understands it.
+
+                # Convert dict to JSON string, then encode to bytes
+                json_payload = json.dumps(iso_request_data)
+                message_body = json_payload.encode('utf-8')
+                
+                # Prepend with 2-byte length header (big-endian unsigned short)
+                # This is a common practice for ISO 8583 over TCP
+                message_length = len(message_body)
+                length_header = struct.pack('!H', message_length) # !H means network byte order (big-endian) unsigned short
+
+                full_message = length_header + message_body
+                
+                logger.info(f"Sending {len(full_message)} bytes to ISO server (payload length: {message_length})...")
+                sock.sendall(full_message)
+
+                # --- Receive ISO 8583 Response ---
+                # First, read the 2-byte length header of the response
+                response_length_header = sock.recv(2)
+                if not response_length_header:
+                    raise ConnectionError("Did not receive length header from ISO server.")
+                response_length = struct.unpack('!H', response_length_header)[0]
+                
+                # Read the actual response body based on the length
+                response_body = b''
+                bytes_received = 0
+                while bytes_received < response_length:
+                    chunk = sock.recv(response_length - bytes_received)
+                    if not chunk:
+                        logger.error("ISO server disconnected while reading response body.")
+                        break
+                    response_body += chunk
+                    bytes_received += len(chunk)
+
+                if bytes_received != response_length:
+                    logger.error(f"Incomplete response received from ISO server. Expected {response_length}, got {bytes_received}.")
+                    raise ConnectionError("Incomplete response from ISO server.")
+
+                # Assuming the response is also JSON wrapped in a length header
+                iso_response_json = response_body.decode('utf-8')
+                iso_response = json.loads(iso_response_json)
+                logger.info(f"Received response from ISO 8583 server: {iso_response}")
+
+        except socket.timeout:
+            logger.error(f"ISO 8583 server connection timed out after {ISO_TIMEOUT} seconds.")
+            iso_response = {'status': 'ERROR', 'message': 'ISO Server Timeout', 'field39': '99'}
+        except ConnectionRefusedError:
+            logger.error(f"Connection to ISO 8583 server refused at {ISO_SERVER_HOST}:{ISO_SERVER_PORT}. Is the server running and accessible?")
+            iso_response = {'status': 'ERROR', 'message': 'Connection Refused (Server not reachable)', 'field39': '99'}
+        except socket.error as e:
+            logger.error(f"Socket error during ISO 8583 communication: {e}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': f'Socket Error: {e}', 'field39': '99'}
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON response from ISO 8583 server: {iso_response_json}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': 'Invalid Server Response Format', 'field39': '99'}
         except Exception as e:
-            logger.critical(f"Critical Error: Unexpected error during internal ISO processing: {e}", exc_info=True)
-            iso_response = {'status': 'ERROR', 'message': f'Internal ISO Processing Error: {e}', 'field39': '99'}
+            logger.critical(f"Critical error during ISO 8583 communication: {e}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': f'Unexpected ISO Communication Error: {e}', 'field39': '99'}
 
         status = iso_response.get('status', 'Declined')
         auth_code_from_iso = iso_response.get('auth_code') # This is the auth code returned by the ISO server
