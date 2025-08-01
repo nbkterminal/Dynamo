@@ -26,8 +26,8 @@ from firebase_admin import credentials, firestore, auth
 from blockchain_client import BlockchainClient
 from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
-from production_config import validate_production_config # Removed get_production_config
-from application_config import get_wallet_config # For merchant wallet addresses
+from production_config import validate_production_config
+from config import get_wallet_config # Corrected import from 'application_config' to 'config'
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
@@ -45,7 +45,6 @@ blockchain_client = BlockchainClient()
 
 # Initialize production security middleware
 security_middleware = SecurityMiddleware(app)
-# production_config = get_production_config() # Removed this line as get_production_config is not defined
 
 # Validate production configuration on startup
 if not validate_production_config():
@@ -65,6 +64,102 @@ DEFAULT_ADMIN = {
     'password_hash': generate_password_hash('Br_3339'), # Default password set back to Br_3339
     'role': ROLES['ADMIN']
 }
+
+# --- Firebase Initialization (for Canvas environment and Render deployments) ---
+# Global variables provided by the Canvas environment at runtime.
+# For local development, you might need to mock them or provide a dummy config.
+app_id = os.environ.get('__app_id', 'default-app-id') # Fallback for local testing
+firebase_config_str = os.environ.get('__firebase_config', '{}') # Fallback for local testing
+initial_auth_token = os.environ.get('__initial_auth_token', None) # Fallback for local testing
+
+# Environment variable for service account key (for Render/non-Canvas deployments)
+FIREBASE_SERVICE_ACCOUNT_KEY_BASE64 = os.environ.get('FIREBASE_SERVICE_ACCOUNT_KEY_BASE64')
+
+db = None # Firestore client
+firebase_auth = None # Firebase Auth client
+current_user_id = None # Authenticated user ID (global)
+
+def initialize_firebase():
+    global db, firebase_auth, current_user_id # Declare global to modify them
+    if not firebase_admin._apps: # Prevent re-initialization if already initialized
+        if FIREBASE_SERVICE_ACCOUNT_KEY_BASE64:
+            # Option 1: Initialize with service account key from environment variable (recommended for Render)
+            try:
+                service_account_info = json.loads(base64.b64decode(FIREBASE_SERVICE_ACCOUNT_KEY_BASE64).decode('utf-8'))
+                cred = credentials.Certificate(service_account_info)
+                firebase_admin.initialize_app(cred)
+                db = firestore.client()
+                firebase_auth = auth # Initialize auth client
+                logger.info("Firebase Admin SDK initialized using service account key from environment variable.")
+            except Exception as e:
+                logger.error(f"Error initializing Firebase with service account key: {e}. Firestore will not be available.")
+                db = None
+                firebase_auth = None
+        elif firebase_config_str:
+            # Option 2: Initialize with Canvas-provided config (for Canvas-native deployments)
+            try:
+                firebase_config = json.loads(firebase_config_str)
+                # Check again if already initialized, as this function might be called multiple times
+                if not firebase_admin._apps:
+                    firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
+                db = firestore.client()
+                firebase_auth = auth # Initialize auth client
+                logger.info("Firebase Admin SDK initialized using Canvas-provided config.")
+            except Exception as e:
+                logger.error(f"Error initializing Firebase with Canvas config: {e}. Firestore will not be available.")
+                db = None
+                firebase_auth = None
+        else:
+            logger.warning("No Firebase config or service account key found in environment. Firestore will not be available.")
+            db = None
+            firebase_auth = None
+    else: # If already initialized (e.g., in a reloader scenario in dev or if called multiple times)
+        db = firestore.client()
+        firebase_auth = auth
+        logger.info("Firebase Admin SDK already initialized. Reusing existing clients.")
+
+
+    # Set current_user_id after Firebase initialization attempt
+    if db: # Only proceed with auth if db client was successfully initialized
+        if initial_auth_token and firebase_auth:
+            try:
+                decoded_token = firebase_auth.verify_id_token(initial_auth_token)
+                current_user_id = decoded_token['uid']
+                logger.info(f"Signed in with custom token. User ID: {current_user_id}")
+            except Exception as e:
+                logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
+                current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
+        else:
+            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
+            logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
+    else:
+        current_user_id = None # Ensure user ID is None if Firebase init failed
+
+# Initialize Firebase when the app starts
+with app.app_context():
+    initialize_firebase()
+
+# --- Firestore Helpers (defined after Firebase init) ---
+def get_transactions_collection_ref():
+    """Returns the Firestore collection reference for transactions."""
+    if db and current_user_id:
+        # Use a public collection path for simplicity in this demo, tied to app_id
+        # For private user data, use: return db.collection(f"artifacts/{app_id}/users/{current_user_id}/transactions")
+        return db.collection(f"artifacts/{app_id}/public/data/transactions")
+    else:
+        logger.error("Firestore DB or current_user_id not initialized. Cannot get collection reference.")
+        # Return a dummy object or raise an error to prevent further Firestore operations
+        class DummyCollectionRef:
+            def document(self, doc_id): return self
+            def set(self, data): pass
+            def get(self): return type('obj', (object,), {'exists': False, 'to_dict': lambda: {}})()
+            def stream(self): return []
+            def order_by(self, *args, **kwargs): return self
+            def limit(self, *args, **kwargs): return self
+            def update(self, data): pass # Add update method for compatibility
+            def add(self, data): pass # Add add method for compatibility
+        return DummyCollectionRef()
+
 
 def init_default_users():
     """
@@ -114,11 +209,10 @@ def login_required(role=None):
         return decorated_function
     return decorator
 
-def initialize_app_components():
-    """Initializes necessary application components on startup."""
-    init_default_users()
+# Initialize the application components when the module is loaded
+# This ensures default users are set up and Firebase is initialized
+initialize_app_components()
 
-# Ensure session permanence before each request
 @app.before_request
 def make_session_permanent():
     session.permanent = True
@@ -161,7 +255,10 @@ def forgot_password():
     """
     Handles the 'Forgot Password' functionality.
     """
+    # This route is currently a placeholder and does not implement TOTP secret generation.
+    # If you need TOTP, you would integrate pyotp here as in previous versions.
     if request.method == 'POST':
+        # In a real application, this would trigger an email or other reset mechanism
         flash('Password reset instructions sent to your email (simulated).', 'info')
         return redirect(url_for('login'))
     return render_template('forgot_password.html')
@@ -176,7 +273,7 @@ def logout():
     return redirect(url_for('login'))
 
 @app.route('/dashboard')
-@login_required() # Removed explicit endpoint
+@login_required()
 def dashboard():
     """Displays the main dashboard. Admin users see admin options."""
     user_role = session.get('user_role')
@@ -188,7 +285,7 @@ def dashboard():
         return redirect(url_for('index')) # Operators go directly to main terminal
 
 @app.route('/admin/config', methods=['GET', 'POST'])
-@login_required(role=ROLES['ADMIN']) # Removed explicit endpoint
+@login_required(role=ROLES['ADMIN'])
 def admin_config():
     """
     Admin configuration management for payout wallets and transaction limits.
@@ -242,7 +339,7 @@ def admin_config():
                            daily_limit=current_daily_limit)
 
 @app.route('/protocol', methods=['GET', 'POST'])
-@login_required() # Removed explicit endpoint
+@login_required()
 def protocol():
     """Allows selection of the payment protocol."""
     PROTOCOLS = {
@@ -269,7 +366,7 @@ def protocol():
     return render_template('protocol.html', protocols=PROTOCOLS.keys())
 
 @app.route('/amount', methods=['GET', 'POST'])
-@login_required() # Removed explicit endpoint
+@login_required()
 def amount():
     """Allows input of the transaction amount and currency."""
     DAILY_LIMIT_PER_TERMINAL = int(os.environ.get('DAILY_LIMIT_PER_TERMINAL', '10000000')) # Default 10M
@@ -314,7 +411,7 @@ def amount():
     return render_template('amount.html', default_amount=default_amount)
 
 @app.route('/payout', methods=['GET', 'POST'])
-@login_required() # Removed explicit endpoint
+@login_required()
 def payout():
     """Allows selection of the crypto payout method and wallet."""
     default_erc20_wallet = os.environ.get('DEFAULT_ERC20_WALLET', '0xDefaultERC20WalletAddressForTesting')
@@ -352,7 +449,7 @@ def payout():
                            default_trc20_wallet=default_trc20_wallet)
 
 @app.route('/card', methods=['GET', 'POST'])
-@login_required() # Removed explicit endpoint
+@login_required()
 def card():
     """Allows input of card details."""
     if request.method == 'POST':
@@ -391,14 +488,13 @@ def card():
     return render_template('card.html')
 
 @app.route('/auth', methods=['GET', 'POST'])
-@login_required() # Removed explicit endpoint
+@login_required()
 def auth():
     """Allows input of the authorization code and triggers the transaction process."""
     expected_length = session.get('code_length', 6) 
     
     if request.method == 'POST':
-        # FIX: Ensure 'code' is a string, even if request.form.get('auth') returns None
-        code = request.form.get('auth', '') 
+        code = request.form.get('auth', '') # Ensure 'code' is a string
         
         if len(code) != expected_length or not code.isdigit():
             flash(f"Authorization code must be {expected_length} digits and numeric.", "error")
@@ -413,7 +509,7 @@ def auth():
             'amount': int(float(session.get('amount')) * 100), # Amount in cents/smallest unit
             'expiry': session.get('exp'),
             'cvv': session.get('cvv'),
-            'auth_code': session.get('auth_code'),
+            'auth_code': session.get('auth_code'), # This is the manual auth code entered by the user
             'transaction_id': generate_transaction_id(), # Generate a new ID for the ISO message
             'currency_code': '840' if session.get('currency') == 'USD' else '978', # ISO 4217 for USD/EUR
             'protocol_type': session.get('protocol')
@@ -488,9 +584,11 @@ def auth():
         if status == 'Approved' and auth_code_from_iso:
             # If ISO server approved and provided an auth code, proceed to manual entry
             current_transaction_details['auth_code_required'] = True # Mark that manual auth code is needed
-            session['message'] = f'Payment authorized by ISO server. Please enter the APP/AUTH Code: {auth_code_from_iso}' # Show the code
-            session['message_type'] = 'info'
-            # Update transaction in Firestore to reflect auth_code_required status
+            # The flash message should guide the user to enter the code they received from the ISO server.
+            # We are showing the ISO-provided auth code directly in the flash message for this simulation.
+            flash(f'Payment authorized by ISO server. Please enter the APP/AUTH Code: {auth_code_from_iso}', 'info')
+            
+            # Update transaction in Firestore to reflect auth_code_required status and iso_auth_code
             if db:
                 try:
                     get_transactions_collection_ref().document(current_transaction_details['transaction_id']).update({'auth_code_required': True, 'iso_auth_code': auth_code_from_iso})
@@ -500,8 +598,7 @@ def auth():
             return redirect(url_for('auth_code_entry_screen', transaction_id=current_transaction_details['transaction_id']))
         else:
             # If ISO server declined or didn't provide an auth code, go to reject screen
-            session['message'] = f'Payment {status}: {message}'
-            session['message_type'] = 'error'
+            flash(f'Payment {status}: {message}', 'error')
             return redirect(url_for('reject_screen', transaction_id=current_transaction_details['transaction_id']))
 
     return render_template('auth.html', code_length=expected_length)
@@ -520,7 +617,7 @@ def get_transaction_details_from_firestore(transaction_id):
     return None
 
 @app.route('/auth_code_entry/<transaction_id>')
-@login_required() # Removed explicit endpoint
+@login_required()
 def auth_code_entry_screen(transaction_id):
     """Renders the dedicated authorization code entry screen."""
     transaction = get_transaction_details_from_firestore(transaction_id)
@@ -539,7 +636,7 @@ def auth_code_entry_screen(transaction_id):
 
 
 @app.route('/complete_payment', methods=['POST'])
-@login_required() # Removed explicit endpoint
+@login_required()
 def complete_payment():
     """
     Handles the completion of payment after manual APP/AUTH code entry.
@@ -611,7 +708,7 @@ def complete_payment():
 
 
 @app.route('/success')
-@login_required() # Removed explicit endpoint
+@login_required()
 def success_screen():
     """Renders the success screen with transaction details."""
     transaction_id = request.args.get('transaction_id')
@@ -624,7 +721,7 @@ def success_screen():
     return render_template('success.html', transaction=transaction)
 
 @app.route('/reject')
-@login_required() # Removed explicit endpoint
+@login_required()
 def reject_screen():
     """Renders the reject screen with transaction details."""
     transaction_id = request.args.get('transaction_id')
@@ -637,7 +734,7 @@ def reject_screen():
     return render_template('reject.html', transaction=transaction)
 
 @app.route('/transaction_history')
-@login_required() # Removed explicit endpoint
+@login_required()
 def transaction_history_screen():
     """Renders the transaction history screen."""
     transactions = []
@@ -660,71 +757,6 @@ def transaction_history_screen():
 
     return render_template('transaction_history.html', transactions=transactions)
 
-
-# --- Firebase Initialization (for Canvas environment) ---
-# Global variables provided by the Canvas environment
-app_id = os.environ.get('__app_id', 'default-app-id')
-firebase_config_str = os.environ.get('__firebase_config', '{}')
-initial_auth_token = os.environ.get('__initial_auth_token', None)
-
-db = None # Firestore client
-current_user_id = None # Authenticated user ID
-
-# Initialize Firebase Admin SDK and Firestore client
-# This block runs when the module is loaded.
-if firebase_config_str:
-    try:
-        firebase_config = json.loads(firebase_config_str)
-        if not firebase_admin._apps: # Prevent re-initialization
-            firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
-        db = firestore.client()
-        logger.info("Firebase Admin SDK initialized successfully.")
-
-        # Authenticate with custom token if provided (Canvas environment)
-        if initial_auth_token:
-            try:
-                decoded_token = auth.verify_id_token(initial_auth_token)
-                current_user_id = decoded_token['uid']
-                logger.info(f"Signed in with custom token. User ID: {current_user_id}")
-            except Exception as e:
-                logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
-                current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
-        else:
-            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
-            logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
-
-    except Exception as e:
-        logger.error(f"Error initializing Firebase Admin SDK: {e}. Firestore will not be available.")
-        db = None # Ensure db is None if initialization fails
-        current_user_id = None # Ensure user ID is None if initialization fails
-else:
-    logger.warning("Firebase config not found in environment variables. Firestore will not be available.")
-    db = None
-    current_user_id = None
-
-# --- Firestore Helpers (defined after Firebase init) ---
-def get_transactions_collection_ref():
-    """Returns the Firestore collection reference for transactions."""
-    if db and current_user_id:
-        # Using a public collection path for simplicity in this demo, tied to app_id
-        # For private user data, use: return db.collection(f"artifacts/{app_id}/users/{current_user_id}/transactions")
-        return db.collection(f"artifacts/{app_id}/public/data/transactions")
-    else:
-        logger.error("Firestore DB or current_user_id not initialized. Cannot get collection reference.")
-        # Return a dummy object to prevent runtime errors if Firestore is not available
-        class DummyCollectionRef:
-            def document(self, doc_id): return self
-            def set(self, data): pass
-            def get(self): return type('obj', (object,), {'exists': False, 'to_dict': lambda: {}})()
-            def stream(self): return []
-            def order_by(self, *args, **kwargs): return self
-            def limit(self, *args, **kwargs): return self
-            def add(self, data): pass # Add add method for compatibility
-        return DummyCollectionRef()
-
-
-# Initialize the application components when the module is loaded
-initialize_app_components()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
