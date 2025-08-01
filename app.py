@@ -166,7 +166,7 @@ def logout():
     return redirect(url_for('login'))
 
 @app.route('/dashboard')
-@login_required()
+@login_required(endpoint='dashboard_route') # Added explicit endpoint
 def dashboard():
     """Displays the main dashboard. Admin users see admin options."""
     user_role = session.get('user_role')
@@ -178,7 +178,7 @@ def dashboard():
         return redirect(url_for('index')) # Operators go directly to main terminal
 
 @app.route('/admin/config', methods=['GET', 'POST'])
-@login_required(role=ROLES['ADMIN'])
+@login_required(role=ROLES['ADMIN'], endpoint='admin_config_route') # Added explicit endpoint
 def admin_config():
     """
     Admin configuration management for payout wallets and transaction limits.
@@ -232,7 +232,7 @@ def admin_config():
                            daily_limit=current_daily_limit)
 
 @app.route('/protocol', methods=['GET', 'POST'])
-@login_required()
+@login_required(endpoint='protocol_route') # Added explicit endpoint
 def protocol():
     """Allows selection of the payment protocol."""
     PROTOCOLS = {
@@ -259,7 +259,7 @@ def protocol():
     return render_template('protocol.html', protocols=PROTOCOLS.keys())
 
 @app.route('/amount', methods=['GET', 'POST'])
-@login_required()
+@login_required(endpoint='amount_route') # Added explicit endpoint
 def amount():
     """Allows input of the transaction amount and currency."""
     DAILY_LIMIT_PER_TERMINAL = int(os.environ.get('DAILY_LIMIT_PER_TERMINAL', '10000000')) # Default 10M
@@ -304,7 +304,7 @@ def amount():
     return render_template('amount.html', default_amount=default_amount)
 
 @app.route('/payout', methods=['GET', 'POST'])
-@login_required()
+@login_required(endpoint='payout_route') # Added explicit endpoint
 def payout():
     """Allows selection of the crypto payout method and wallet."""
     default_erc20_wallet = os.environ.get('DEFAULT_ERC20_WALLET', '0xDefaultERC20WalletAddressForTesting')
@@ -342,7 +342,7 @@ def payout():
                            default_trc20_wallet=default_trc20_wallet)
 
 @app.route('/card', methods=['GET', 'POST'])
-@login_required()
+@login_required(endpoint='card_route') # Added explicit endpoint
 def card():
     """Allows input of card details."""
     if request.method == 'POST':
@@ -381,7 +381,7 @@ def card():
     return render_template('card.html')
 
 @app.route('/auth', methods=['GET', 'POST'])
-@login_required()
+@login_required(endpoint='auth_route') # Added explicit endpoint
 def auth():
     """Allows input of the authorization code and triggers the transaction process."""
     expected_length = session.get('code_length', 6) 
@@ -510,7 +510,7 @@ def get_transaction_details_from_firestore(transaction_id):
     return None
 
 @app.route('/auth_code_entry/<transaction_id>')
-@login_required
+@login_required(endpoint='auth_code_entry_screen_route') # Added explicit endpoint
 def auth_code_entry_screen(transaction_id):
     """Renders the dedicated authorization code entry screen."""
     transaction = get_transaction_details_from_firestore(transaction_id)
@@ -529,7 +529,7 @@ def auth_code_entry_screen(transaction_id):
 
 
 @app.route('/complete_payment', methods=['POST'])
-@login_required
+@login_required(endpoint='complete_payment_route') # Added explicit endpoint
 def complete_payment():
     """
     Handles the completion of payment after manual APP/AUTH code entry.
@@ -601,7 +601,7 @@ def complete_payment():
 
 
 @app.route('/success')
-@login_required
+@login_required(endpoint='success_screen_route') # Added explicit endpoint
 def success_screen():
     """Renders the success screen with transaction details."""
     transaction_id = request.args.get('transaction_id')
@@ -614,7 +614,7 @@ def success_screen():
     return render_template('success.html', transaction=transaction)
 
 @app.route('/reject')
-@login_required
+@login_required(endpoint='reject_screen_route') # Added explicit endpoint
 def reject_screen():
     """Renders the reject screen with transaction details."""
     transaction_id = request.args.get('transaction_id')
@@ -627,7 +627,7 @@ def reject_screen():
     return render_template('reject.html', transaction=transaction)
 
 @app.route('/transaction_history')
-@login_required
+@login_required(endpoint='transaction_history_screen_route') # Added explicit endpoint
 def transaction_history_screen():
     """Renders the transaction history screen."""
     transactions = []
