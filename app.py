@@ -26,8 +26,8 @@ from firebase_admin import credentials, firestore, auth
 from blockchain_client import BlockchainClient
 from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
-from production_config import get_production_config, validate_production_config
-from application_config import get_wallet_config # For merchant wallet addresses
+from production_config import validate_production_config # Removed get_production_config
+from config import get_wallet_config # For merchant wallet addresses
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
@@ -45,7 +45,7 @@ blockchain_client = BlockchainClient()
 
 # Initialize production security middleware
 security_middleware = SecurityMiddleware(app)
-production_config = get_production_config()
+# production_config = get_production_config() # Removed this line as get_production_config is not defined
 
 # Validate production configuration on startup
 if not validate_production_config():
