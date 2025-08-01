@@ -15,7 +15,7 @@ import os
 import time
 import random
 from web3 import Web3
-from web3.middleware import geth_poa_middleware # Potentially useful for some EVM chains
+from web3.middleware import ExtraDataToPOAMiddleware # For Proof-of-Authority chains like Goerli, Polygon, BNB Chain
 import json # For loading ERC-20 ABI
 from tronpy import Tron
 from tronpy.providers import HTTPProvider
