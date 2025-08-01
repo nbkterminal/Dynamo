@@ -5,7 +5,7 @@ gunicorn
 web3
 tronpy
 requests
-firebase-admin==6.1.0 # Pin to a stable version
-grpcio==1.64.1 # Pin to a specific version that often has pre-built wheels
-grpcio-tools==1.64.1 # Pin to a specific version
-python-dotenv # For loading .env files locally
+firebase-admin==6.1.0
+grpcio>=1.74.0,<1.75.0  # Use a newer, more stable range
+grpcio-tools>=1.74.0,<1.75.0 # Use a newer, more stable range
+python-dotenv
