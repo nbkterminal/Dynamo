@@ -28,7 +28,7 @@ from blockchain_client import BlockchainClient
 from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
 from production_config import validate_production_config
-from application_config import get_wallet_config # Corrected import from 'application_config' to 'config'
+from config import get_wallet_config # Corrected import from 'application_config' to 'config'
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
@@ -489,6 +489,7 @@ def card():
             session['card_type'] = "UNKNOWN"
         
         logger.info(f"Card entered: {session['card_type']} ending in {pan[-4:]}")
+        # Redirect to the auth route for manual code entry
         return redirect(url_for('auth'))
     
     return render_template('card.html')
@@ -496,17 +497,20 @@ def card():
 @app.route('/auth', methods=['GET', 'POST'])
 @login_required()
 def auth():
-    """Allows input of the authorization code and triggers the transaction process."""
+    """
+    Handles the manual input of the authorization code and triggers the ISO transaction process.
+    """
     expected_length = session.get('code_length', 6) 
     
     if request.method == 'POST':
-        code = request.form.get('auth', '') # Ensure 'code' is a string
+        # This block executes when the user submits the manual auth code form
+        code = request.form.get('auth', '') # Get the manually entered auth code
         
         if len(code) != expected_length or not code.isdigit():
             flash(f"Authorization code must be {expected_length} digits and numeric.", "error")
             return render_template('auth.html', code_length=expected_length, warning=f"Code must be {expected_length} digits and numeric.")
 
-        session['auth_code'] = code
+        session['auth_code'] = code # Store the user's manual auth code in session
 
         # Prepare data for ISO 8583 message to be sent to the ISO Gateway Service
         iso_request_data = {
@@ -515,23 +519,21 @@ def auth():
             'amount': int(float(session.get('amount')) * 100), # Amount in cents/smallest unit
             'expiry': session.get('exp'),
             'cvv': session.get('cvv'),
-            'auth_code': session.get('auth_code'), # This is the manual auth code entered by the user
+            'auth_code': session.get('auth_code'), # Use the user's manually entered auth code here
             'transaction_id': generate_transaction_id(), # Generate a new ID for the ISO message
             'currency_code': '840' if session.get('currency') == 'USD' else '978', # ISO 4217 for USD/EUR
             'protocol_type': session.get('protocol')
         }
 
         # Get ISO Gateway Service URL from environment variable
-        # This URL will point to your deployed iso_gateway.py service
-        ISO_GATEWAY_URL = os.environ.get('ISO_GATEWAY_URL', 'http://127.0.0.1:5001/process_iso_request') # Default to local gateway
-        ISO_HTTP_TIMEOUT = int(os.environ.get('ISO_HTTP_TIMEOUT', 60)) # Timeout for HTTP request to gateway
+        ISO_GATEWAY_URL = os.environ.get('ISO_GATEWAY_URL', 'http://127.0.0.1:5001/process_iso_request')
+        ISO_HTTP_TIMEOUT = int(os.environ.get('ISO_HTTP_TIMEOUT', 60))
 
-        logger.info(f"Sending payment request to ISO Gateway Service at {ISO_GATEWAY_URL}...")
+        logger.info(f"Sending payment request to ISO Gateway Service at {ISO_GATEWAY_URL} with manual auth code...")
         iso_response = {}
         try:
-            # Send HTTP POST request to the ISO Gateway Service
             response = requests.post(ISO_GATEWAY_URL, json=iso_request_data, timeout=ISO_HTTP_TIMEOUT)
-            response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+            response.raise_for_status()
             iso_response = response.json()
             logger.info(f"Received response from ISO Gateway Service: {iso_response}")
 
@@ -552,12 +554,12 @@ def auth():
             iso_response = {'status': 'ERROR', 'message': f'Unexpected Gateway Communication Error: {e}', 'field39': '99'}
 
         status = iso_response.get('status', 'Declined')
-        auth_code_from_iso = iso_response.get('auth_code') # This is the auth code from the ISO server
+        auth_code_from_iso = iso_response.get('auth_code') # This is the auth code returned by the ISO server
         message = iso_response.get('message', 'Unknown error.')
         field39_resp = iso_response.get('field39', 'XX') # ISO 8583 Field 39 Response Code
 
         current_transaction_details = {
-            'transaction_id': iso_request_data['transaction_id'], # Use the ID generated for the ISO message
+            'transaction_id': iso_request_data['transaction_id'],
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'card_number': session.get('pan'),
             'amount': float(session.get('amount')),
@@ -565,48 +567,68 @@ def auth():
             'protocol_type': session.get('protocol'),
             'crypto_network_type': session.get('payout_type'),
             'status': status,
-            'auth_code_required': False, # Will be set to True if ISO response implies manual entry
             'payout_status': None,
             'crypto_payout_amount': 0.0,
             'simulated_gas_fee': 0.0,
             'crypto_address': '',
             'iso_field39': field39_resp,
-            'message': message, # Store the message from ISO server/gateway
-            'iso_auth_code': auth_code_from_iso # Store the auth code received from ISO server
+            'message': message,
+            'iso_auth_code': auth_code_from_iso, # Store the auth code received from ISO server for records
+            'entered_auth_code': code # Store the code manually entered by the user
         }
 
         # Store initial transaction in Firestore for persistence
-        if db: # Only attempt Firestore operations if db client is initialized
+        if db:
             try:
                 get_transactions_collection_ref().document(current_transaction_details['transaction_id']).set(current_transaction_details)
-                logger.info(f"Firestore: Stored initial transaction {current_transaction_details['transaction_id']}")
+                logger.info(f"Firestore: Stored transaction {current_transaction_details['transaction_id']} with status {status}")
             except Exception as e:
-                logger.error(f"Firestore Error: Could not store initial transaction {current_transaction_details['transaction_id']}: {e}")
+                logger.error(f"Firestore Error: Could not store transaction {current_transaction_details['transaction_id']}: {e}")
                 flash("Failed to log transaction to history.", "warning")
         else:
             logger.warning("Firestore not initialized. Transaction logging skipped.")
 
-        # Determine next step based on ISO response
-        if status == 'Approved' and auth_code_from_iso:
-            # If ISO server approved and provided an auth code, proceed to manual entry
-            current_transaction_details['auth_code_required'] = True # Mark that manual auth code is needed
-            # The flash message should guide the user to enter the code they received from the ISO server.
-            # We are showing the ISO-provided auth code directly in the flash message for this simulation.
-            flash(f'Payment authorized by ISO server. Please enter the APP/AUTH Code: {auth_code_from_iso}', 'info')
-            
-            # Update transaction in Firestore to reflect auth_code_required status and iso_auth_code
+        # Proceed directly to success or reject screen based on ISO response
+        if status == 'Approved':
+            # If approved by ISO, proceed with crypto payout
+            recipient_wallet_info = get_wallet_config(current_transaction_details['crypto_network_type'])
+            recipient_crypto_address = recipient_wallet_info['address']
+
+            crypto_payout_result = blockchain_client.send_usdt(
+                network=current_transaction_details['crypto_network_type'].lower(),
+                to_address=recipient_crypto_address,
+                amount_usd=current_transaction_details['amount']
+            )
+
+            current_transaction_details['crypto_payout_amount'] = crypto_payout_result.get('payout_amount_usdt', 0.0)
+            current_transaction_details['simulated_gas_fee'] = crypto_payout_result.get('simulated_gas_fee_usdt', 0.0)
+            current_transaction_details['payout_status'] = crypto_payout_result.get('status')
+            current_transaction_details['status'] = 'Completed' if crypto_payout_result.get('status') == 'Success' else 'Payout Failed'
+            current_transaction_details['crypto_address'] = recipient_crypto_address
+            current_transaction_details['blockchain_hash'] = crypto_payout_result.get('tx_hash', 'N/A') # Use 'tx_hash' from BlockchainClient
+            current_transaction_details['message'] = crypto_payout_result.get('message', 'Payment and Crypto Payout Completed.')
+
+            # Update transaction in Firestore with payout details
             if db:
                 try:
-                    get_transactions_collection_ref().document(current_transaction_details['transaction_id']).update({'auth_code_required': True, 'iso_auth_code': auth_code_from_iso})
+                    get_transactions_collection_ref().document(current_transaction_details['transaction_id']).update(current_transaction_details)
+                    logger.info(f"Firestore: Updated completed transaction {current_transaction_details['transaction_id']} with payout status {current_transaction_details['payout_status']}")
                 except Exception as e:
-                    logger.error(f"Firestore Error: Could not update auth_code_required for {current_transaction_details['transaction_id']}: {e}")
-            
-            return redirect(url_for('auth_code_entry_screen', transaction_id=current_transaction_details['transaction_id']))
+                    logger.error(f"Firestore Error: Could not update completed transaction {current_transaction_details['transaction_id']}: {e}")
+                    flash("Failed to update transaction history with payout details.", "warning")
+
+            if current_transaction_details['status'] == 'Completed':
+                flash("Payment Approved and Payout Initiated!", "success")
+                return redirect(url_for('success_screen', transaction_id=current_transaction_details['transaction_id']))
+            else:
+                flash(f"Payment Approved, but Payout Failed: {current_transaction_details['message']}", "warning")
+                return redirect(url_for('reject_screen', transaction_id=current_transaction_details['transaction_id']))
         else:
-            # If ISO server declined or didn't provide an auth code, go to reject screen
+            # If ISO server declined, go to reject screen
             flash(f'Payment {status}: {message}', 'error')
             return redirect(url_for('reject_screen', transaction_id=current_transaction_details['transaction_id']))
 
+    # This block executes for GET request to /auth
     return render_template('auth.html', code_length=expected_length)
 
 # --- Helper function for retrieving transaction details from Firestore ---
@@ -622,96 +644,8 @@ def get_transaction_details_from_firestore(transaction_id):
             logger.error(f"Firestore Error: Could not retrieve transaction {transaction_id}: {e}")
     return None
 
-@app.route('/auth_code_entry/<transaction_id>')
-@login_required()
-def auth_code_entry_screen(transaction_id):
-    """Renders the dedicated authorization code entry screen."""
-    transaction = get_transaction_details_from_firestore(transaction_id)
-    # Ensure transaction exists and it was marked as requiring auth code
-    if not transaction or not transaction.get('auth_code_required'):
-        flash('Invalid or expired transaction for auth code entry.', 'error')
-        return redirect(url_for('index'))
-    
-    # Pass the expected auth code from the ISO server to the template for display/hint
-    # This is for the scenario where the ISO server provides the code and the merchant keys it in.
-    iso_provided_auth_code = transaction.get('iso_auth_code', 'N/A')
-    
-    return render_template('auth_code_entry.html', 
-                           transaction_id=transaction_id,
-                           iso_provided_auth_code=iso_provided_auth_code)
-
-
-@app.route('/complete_payment', methods=['POST'])
-@login_required()
-def complete_payment():
-    """
-    Handles the completion of payment after manual APP/AUTH code entry.
-    Triggers the crypto payout.
-    """
-    transaction_id = request.form['transaction_id']
-    entered_auth_code = request.form['auth_code']
-
-    transaction_details = get_transaction_details_from_firestore(transaction_id)
-    if not transaction_details:
-        flash('Invalid or expired transaction ID.', 'error')
-        return redirect(url_for('index'))
-
-    # Compare the entered auth code with the one received from the ISO server
-    # This simulates the final verification step.
-    expected_auth_code_from_iso = transaction_details.get('iso_auth_code')
-
-    if entered_auth_code == expected_auth_code_from_iso:
-        # Authorization successful, proceed with crypto payout
-        recipient_wallet_info = get_wallet_config(transaction_details['crypto_network_type'])
-        recipient_crypto_address = recipient_wallet_info['address']
-
-        crypto_payout_result = blockchain_client.send_usdt( # Use blockchain_client for real payouts
-            network=transaction_details['crypto_network_type'].lower(),
-            to_address=recipient_crypto_address,
-            amount_usd=transaction_details['amount']
-        )
-
-        transaction_details['crypto_payout_amount'] = crypto_payout_result.get('payout_amount_usdt', 0.0)
-        transaction_details['simulated_gas_fee'] = crypto_payout_result.get('simulated_gas_fee_usdt', 0.0)
-        transaction_details['payout_status'] = crypto_payout_result.get('status')
-        transaction_details['status'] = 'Completed' # Overall transaction status
-        transaction_details['auth_code_required'] = False # No longer required
-        transaction_details['crypto_address'] = recipient_crypto_address # Store for display
-        transaction_details['blockchain_hash'] = crypto_payout_result.get('transaction_hash', 'N/A') # Store real hash
-        transaction_details['message'] = crypto_payout_result.get('message', 'Payment and Crypto Payout Completed.')
-
-        # Update transaction in Firestore
-        if db:
-            try:
-                get_transactions_collection_ref().document(transaction_id).set(transaction_details)
-                logger.info(f"Firestore: Updated completed transaction {transaction_id}")
-            except Exception as e:
-                logger.error(f"Firestore Error: Could not update completed transaction {transaction_id}: {e}")
-                flash("Failed to update transaction history.", "warning")
-        
-        if crypto_payout_result.get('status') == 'Success':
-            flash("Payment Approved and Payout Initiated!", "success")
-            return redirect(url_for('success_screen', transaction_id=transaction_id))
-        else:
-            flash(f"Payment Completed, but Payout Failed: {transaction_details['message']}", "warning")
-            return redirect(url_for('reject_screen', transaction_id=transaction_id))
-
-    else:
-        transaction_details['status'] = 'Declined (Auth Code Mismatch)'
-        transaction_details['message'] = 'Invalid APP/AUTH Code. Payment failed.'
-        
-        # Update transaction in Firestore as declined
-        if db:
-            try:
-                get_transactions_collection_ref().document(transaction_id).set(transaction_details)
-                logger.info(f"Firestore: Updated declined transaction {transaction_id}")
-            except Exception as e:
-                logger.error(f"Firestore Error: Could not update declined transaction {transaction_id}: {e}")
-                flash("Failed to update transaction history.", "warning")
-
-        flash('Invalid APP/AUTH Code. Payment failed.', 'error')
-        return redirect(url_for('reject_screen', transaction_id=transaction_id))
-
+# Removed the /auth_code_entry/<transaction_id> and /complete_payment routes
+# as the manual auth code entry now happens directly on the /auth page.
 
 @app.route('/success')
 @login_required()
