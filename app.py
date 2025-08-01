@@ -34,7 +34,7 @@ from firebase_admin import credentials, firestore, auth
 from blockchain_client import BlockchainClient
 from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
-from production_config import get_production_config, validate_production_config
+from production_config import validate_production_config
 from config import get_wallet_config # For merchant wallet addresses
 
 # Configure logging for the application
