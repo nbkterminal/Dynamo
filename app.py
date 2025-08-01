@@ -1,34 +1,32 @@
 # app.py
 # This is the main Flask application for the BlackRock Payment Terminal.
-# It handles user authentication, transaction flow, communication with the
-# iso_gateway.py service (via HTTP) for card authorization, and real-time
-# cryptocurrency payouts.
-# Now with Firestore integration for persistent transaction history.
+# It handles user authentication, transaction flow, direct communication with an external
+# ISO 8583 server for card authorization via TCP sockets, and real-time cryptocurrency payouts.
 
 import os
-import json # For parsing Firebase config
+import json
 import hashlib
 import logging
 import random
 import re
 from datetime import datetime, date, timedelta
 from functools import wraps
-import requests # Used for HTTP communication with the iso_gateway.py service
-import base64 # Explicitly imported here to ensure it's available for Firebase init
+import socket # For direct TCP socket communication with ISO 8583 server
+import struct # For packing/unpacking binary data (e.g., message length)
 
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Firebase Admin SDK for server-side interaction with Firestore
 import firebase_admin
-from firebase_admin import credentials, firestore, auth
+from firebase_admin import credentials, firestore, auth # Added for Firebase initialization
 
-# Import custom modules
-from blockchain_client import BlockchainClient
-from utils import validate_card_number, format_amount, generate_transaction_id
+# Import custom modules for blockchain interaction and utilities
+from blockchain_client import BlockchainClient # Handles crypto payouts
+from utils import validate_card_number, format_amount, generate_transaction_id # Keeping utils for card validation, etc.
 from security_middleware import SecurityMiddleware, audit_log, require_role
-from production_config import validate_production_config
-from application_config import get_wallet_config # Corrected import from 'application_config' to 'config'
+from production_config import get_production_config, validate_production_config # For production readiness checks
+from application_config import get_wallet_config # For merchant wallet addresses
 
 # Configure logging for the application
 logging.basicConfig(level=logging.INFO) # Set to INFO for production, DEBUG for development
@@ -46,6 +44,7 @@ blockchain_client = BlockchainClient()
 
 # Initialize production security middleware
 security_middleware = SecurityMiddleware(app)
+production_config = get_production_config()
 
 # Validate production configuration on startup
 if not validate_production_config():
@@ -100,9 +99,7 @@ def initialize_firebase():
             # Option 2: Initialize with Canvas-provided config (for Canvas-native deployments)
             try:
                 firebase_config = json.loads(firebase_config_str)
-                # Check again if already initialized, as this function might be called multiple times
-                if not firebase_admin._apps:
-                    firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
+                firebase_admin.initialize_app(options={'projectId': firebase_config.get('projectId')})
                 db = firestore.client()
                 firebase_auth = auth # Initialize auth client
                 logger.info("Firebase Admin SDK initialized using Canvas-provided config.")
@@ -135,10 +132,6 @@ def initialize_firebase():
             logger.info(f"No initial auth token. Signed in anonymously. User ID: {current_user_id}")
     else:
         current_user_id = None # Ensure user ID is None if Firebase init failed
-
-# Initialize Firebase when the app starts
-with app.app_context():
-    initialize_firebase()
 
 # --- Firestore Helpers (defined after Firebase init) ---
 def get_transactions_collection_ref():
@@ -210,14 +203,15 @@ def login_required(role=None):
         return decorated_function
     return decorator
 
-# This function must be defined before it's called.
-def initialize_app_components():
-    """Initializes necessary application components on startup."""
-    init_default_users()
+# New comprehensive setup function to ensure correct initialization order
+def setup_application_components():
+    """Performs all necessary application setup on startup."""
+    initialize_firebase() # Call directly, as Flask's startup handles app.app_context()
+    init_default_users() # Call the default user initialization
 
 # Initialize the application components when the module is loaded
 # This ensures default users are set up and Firebase is initialized
-initialize_app_components()
+setup_application_components()
 
 @app.before_request
 def make_session_permanent():
@@ -512,7 +506,7 @@ def auth():
 
         session['auth_code'] = code # Store the user's manual auth code in session
 
-        # Prepare data for ISO 8583 message to be sent to the ISO Gateway Service
+        # Prepare data for ISO 8583 message (as a dictionary)
         iso_request_data = {
             'mti': '0100',  # Authorization Request
             'pan': session.get('pan'),
@@ -525,33 +519,85 @@ def auth():
             'protocol_type': session.get('protocol')
         }
 
-        # Get ISO Gateway Service URL from environment variable
-        ISO_GATEWAY_URL = os.environ.get('ISO_GATEWAY_URL', 'http://127.0.0.1:5001/process_iso_request')
-        ISO_HTTP_TIMEOUT = int(os.environ.get('ISO_HTTP_TIMEOUT', 60))
+        # Get ISO server details from environment variables
+        ISO_SERVER_HOST = os.environ.get('ISO_SERVER_HOST', '66.185.176.0') # Default for demo, must be real in prod
+        ISO_SERVER_PORT = int(os.environ.get('ISO_SERVER_PORT', 20)) # Default for demo, must be real in prod
+        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 60)) # Timeout for socket connection
 
-        logger.info(f"Sending payment request to ISO Gateway Service at {ISO_GATEWAY_URL} with manual auth code...")
+        logger.info(f"Attempting direct ISO 8583 connection to {ISO_SERVER_HOST}:{ISO_SERVER_PORT}...")
         iso_response = {}
         try:
-            response = requests.post(ISO_GATEWAY_URL, json=iso_request_data, timeout=ISO_HTTP_TIMEOUT)
-            response.raise_for_status()
-            iso_response = response.json()
-            logger.info(f"Received response from ISO Gateway Service: {iso_response}")
+            # Create a socket connection
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(ISO_TIMEOUT)
+                sock.connect((ISO_SERVER_HOST, ISO_SERVER_PORT))
+                logger.info("Connected to ISO 8583 server.")
 
-        except requests.exceptions.Timeout:
-            logger.error(f"Error: Request to ISO Gateway Service timed out after {ISO_HTTP_TIMEOUT} seconds.")
-            iso_response = {'status': 'ERROR', 'message': 'ISO Gateway Timeout', 'field39': '99'}
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Error: Could not connect to ISO Gateway Service at {ISO_GATEWAY_URL}: {e}")
-            iso_response = {'status': 'ERROR', 'message': f'ISO Gateway Unreachable: {e}', 'field39': '99'}
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error: An HTTP error occurred during the request to ISO Gateway: {e}", exc_info=True)
-            iso_response = {'status': 'ERROR', 'message': f'ISO Gateway HTTP Error: {e}', 'field39': '99'}
+                # --- Build ISO 8583 Message (JSON payload with 2-byte length header) ---
+                # This logic assumes the target ISO 8583 server expects a JSON payload
+                # wrapped with a 2-byte length header over the TCP socket.
+                # In a real-world scenario with a standard ISO 8583 processor,
+                # you would use a dedicated Python ISO 8583 library (e.g., py8583)
+                # to pack the MTI, bitmap, and data elements into a binary message.
+                # For this demo, we're sending JSON for simplicity, assuming the
+                # external server (or a mock one like server.py) understands it.
+
+                # Convert dict to JSON string, then encode to bytes
+                json_payload = json.dumps(iso_request_data)
+                message_body = json_payload.encode('utf-8')
+                
+                # Prepend with 2-byte length header (big-endian unsigned short)
+                # This is a common practice for ISO 8583 over TCP
+                message_length = len(message_body)
+                length_header = struct.pack('!H', message_length) # !H means network byte order (big-endian) unsigned short
+
+                full_message = length_header + message_body
+                
+                logger.info(f"Sending {len(full_message)} bytes to ISO server (payload length: {message_length})...")
+                sock.sendall(full_message)
+
+                # --- Receive ISO 8583 Response ---
+                # First, read the 2-byte length header of the response
+                response_length_header = sock.recv(2)
+                if not response_length_header:
+                    raise ConnectionError("Did not receive length header from ISO server.")
+                response_length = struct.unpack('!H', response_length_header)[0]
+                
+                # Read the actual response body based on the length
+                response_body = b''
+                bytes_received = 0
+                while bytes_received < response_length:
+                    chunk = sock.recv(response_length - bytes_received)
+                    if not chunk:
+                        logger.error("ISO server disconnected while reading response body.")
+                        break
+                    response_body += chunk
+                    bytes_received += len(chunk)
+
+                if bytes_received != response_length:
+                    logger.error(f"Incomplete response received from ISO server. Expected {response_length}, got {bytes_received}.")
+                    raise ConnectionError("Incomplete response from ISO server.")
+
+                # Assuming the response is also JSON wrapped in a length header
+                iso_response_json = response_body.decode('utf-8')
+                iso_response = json.loads(iso_response_json)
+                logger.info(f"Received response from ISO 8583 server: {iso_response}")
+
+        except socket.timeout:
+            logger.error(f"ISO 8583 server connection timed out after {ISO_TIMEOUT} seconds.")
+            iso_response = {'status': 'ERROR', 'message': 'ISO Server Timeout', 'field39': '99'}
+        except ConnectionRefusedError:
+            logger.error(f"Connection to ISO 8583 server refused at {ISO_SERVER_HOST}:{ISO_SERVER_PORT}. Is the server running and accessible?")
+            iso_response = {'status': 'ERROR', 'message': 'Connection Refused (Server not reachable)', 'field39': '99'}
+        except socket.error as e:
+            logger.error(f"Socket error during ISO 8583 communication: {e}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': f'Socket Error: {e}', 'field39': '99'}
         except json.JSONDecodeError:
-            logger.error(f"Error: Invalid JSON response from ISO Gateway Service.", exc_info=True)
-            iso_response = {'status': 'ERROR', 'message': 'Invalid Gateway Response Format', 'field39': '99'}
+            logger.error(f"Invalid JSON response from ISO 8583 server: {iso_response_json}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': 'Invalid Server Response Format', 'field39': '99'}
         except Exception as e:
-            logger.critical(f"Critical Error: Unexpected error in auth route during gateway communication: {e}", exc_info=True)
-            iso_response = {'status': 'ERROR', 'message': f'Unexpected Gateway Communication Error: {e}', 'field39': '99'}
+            logger.critical(f"Critical error during ISO 8583 communication: {e}", exc_info=True)
+            iso_response = {'status': 'ERROR', 'message': f'Unexpected ISO Communication Error: {e}', 'field39': '99'}
 
         status = iso_response.get('status', 'Declined')
         auth_code_from_iso = iso_response.get('auth_code') # This is the auth code returned by the ISO server
@@ -594,6 +640,7 @@ def auth():
             recipient_wallet_info = get_wallet_config(current_transaction_details['crypto_network_type'])
             recipient_crypto_address = recipient_wallet_info['address']
 
+            # Call the real blockchain_client to send USDT
             crypto_payout_result = blockchain_client.send_usdt(
                 network=current_transaction_details['crypto_network_type'].lower(),
                 to_address=recipient_crypto_address,
@@ -605,7 +652,7 @@ def auth():
             current_transaction_details['payout_status'] = crypto_payout_result.get('status')
             current_transaction_details['status'] = 'Completed' if crypto_payout_result.get('status') == 'Success' else 'Payout Failed'
             current_transaction_details['crypto_address'] = recipient_crypto_address
-            current_transaction_details['blockchain_hash'] = crypto_payout_result.get('tx_hash', 'N/A') # Use 'tx_hash' from BlockchainClient
+            current_transaction_details['blockchain_hash'] = crypto_payout_result.get('transaction_hash', 'N/A') # Use 'transaction_hash' from isocrypto.py
             current_transaction_details['message'] = crypto_payout_result.get('message', 'Payment and Crypto Payout Completed.')
 
             # Update transaction in Firestore with payout details
