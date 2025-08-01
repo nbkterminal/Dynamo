@@ -528,7 +528,7 @@ def auth():
         # Get ISO server details from environment variables
         ISO_SERVER_HOST = os.environ.get('ISO_SERVER_HOST', '127.0.0.1') # Default for local testing
         ISO_SERVER_PORT = int(os.environ.get('ISO_SERVER_PORT', 12345)) # Default for local testing
-        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 60)) # Timeout for socket connection
+        ISO_TIMEOUT = int(os.environ.get('ISO_TIMEOUT', 120)) # Timeout for socket connection
 
         logger.info(f"Attempting direct ISO 8583 connection to {ISO_SERVER_HOST}:{ISO_SERVER_PORT}...")
         iso_response = {}
