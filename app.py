@@ -14,6 +14,7 @@ import re
 from datetime import datetime, date, timedelta
 from functools import wraps
 import requests # Used for HTTP communication with the iso_gateway.py service
+import base64 # Explicitly imported here to ensure it's available for Firebase init
 
 from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -208,6 +209,11 @@ def login_required(role=None):
             return f(*args, **kwargs)
         return decorated_function
     return decorator
+
+# This function must be defined before it's called.
+def initialize_app_components():
+    """Initializes necessary application components on startup."""
+    init_default_users()
 
 # Initialize the application components when the module is loaded
 # This ensures default users are set up and Firebase is initialized
