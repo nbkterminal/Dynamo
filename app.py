@@ -157,6 +157,19 @@ def login():
     
     return render_template('login.html')
 
+@app.route('/forgot_password', methods=['GET', 'POST'], endpoint='forgot_password')
+def forgot_password():
+    """
+    Handles the 'Forgot Password' functionality.
+    For now, this is a placeholder.
+    """
+    if request.method == 'POST':
+        # In a real application, you'd process the form here (e.g., send reset email)
+        flash('Password reset instructions sent to your email (simulated).', 'info')
+        # Ensure 'login' is the correct endpoint name for your login route
+        return redirect(url_for('login')) 
+    return render_template('forgot_password.html') # You'll need to create this template
+
 @app.route('/logout', endpoint='logout') # Explicitly named endpoint
 def logout():
     """Handles user logout, clearing the session."""
